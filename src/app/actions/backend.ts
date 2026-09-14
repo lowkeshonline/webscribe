@@ -1,0 +1,1578 @@
+'use server';
+
+import { randomBytes } from 'node:crypto';
+import { revalidatePath } from 'next/cache';
+import { headers, cookies } from 'next/headers';
+import { AccountCredential, AdminOrderPage, AdminTicketPage, CustomerOrderPage, CustomerTicketPage, Service, UserProfile } from '@/types';
+import { getSupabaseAdmin, getSupabaseAuth } from '@/lib/server/supabaseAdmin';
+import { isAdminEmail, normalizeEmail } from '@/lib/server/authz';
+import { getAdminPassword } from '@/lib/server/env';
+import { decryptCredential, encryptCredential } from '@/lib/server/credentialCrypto';
+import { mapOrderRow, mapProfileRow, mapServiceRow, mapTicketRow } from '@/lib/server/mappers';
+import { isValidEmail, isValidFullName, isValidPasswordLength, isValidTelegramUsername, normalizeIndianWhatsappNumber } from '@/lib/validation';
+import {
+  getCurrentProfile,
+  getCurrentSessionUser,
+  createOAuthCookieStorage,
+  refreshCurrentSession,
+  requireCurrentAdmin,
+  requireCurrentProfile,
+  revokeCurrentSession,
+  setAuthCookies,
+} from '@/lib/server/session';
+import {
+  buildPaymentNotification,
+  buildTicketNotification,
+  sendTelegramMessage,
+} from '@/lib/server/telegram';
+
+export type ActionResult<T = null> =
+  | { ok: true; data: T }
+  | { ok: false; error: string };
+
+class ActionError extends Error {}
+
+const actionError = (message: string) => new ActionError(message);
+
+const fail = <T = null,>(error: unknown): ActionResult<T> => {
+  if (error instanceof ActionError) {
+    return { ok: false, error: error.message };
+  }
+
+  if (error instanceof Error && (error.message === 'Authentication required.' || error.message.startsWith('Forbidden:'))) {
+    return { ok: false, error: error.message };
+  }
+
+  console.error('Server action failed:', error);
+  return { ok: false, error: 'The request could not be completed. Please try again.' };
+};
+
+const asString = (value: unknown, field: string) => {
+  if (typeof value !== 'string' || !value.trim()) {
+    throw actionError(`${field} is required.`);
+  }
+  return value.trim();
+};
+
+const asOptionalString = (value: unknown) => {
+  return typeof value === 'string' && value.trim() ? value.trim() : undefined;
+};
+
+const normalizeTelegram = (value: unknown) => {
+  const raw = asOptionalString(value);
+  if (!raw) return undefined;
+  if (!isValidTelegramUsername(raw)) {
+    throw actionError('Enter a valid Telegram username with 5-32 letters, numbers, or underscores.');
+  }
+  const username = raw.replace(/^@/, '');
+  return `@${username}`;
+};
+
+const normalizeWhatsapp = (value: unknown) => {
+  const raw = asOptionalString(value);
+  if (!raw) return undefined;
+  const number = normalizeIndianWhatsappNumber(raw);
+  if (!number) {
+    throw actionError('Enter a valid Indian WhatsApp number: 10 digits starting with 6-9, optionally with +91.');
+  }
+  return number;
+};
+
+const normalizeInputEmail = (value: unknown) => {
+  const email = normalizeEmail(asString(value, 'email'));
+  if (!isValidEmail(email)) throw actionError('Enter a valid email address.');
+  return email;
+};
+
+const normalizeFullName = (value: unknown) => {
+  const fullName = asString(value, 'fullName').replace(/\s+/g, ' ');
+  if (!isValidFullName(fullName)) {
+    throw actionError('Enter a valid full name using letters, spaces, apostrophes, periods, or hyphens.');
+  }
+  return fullName;
+};
+
+const validateUserPassword = (value: unknown, field = 'Password') => {
+  const password = asString(value, field);
+  if (!isValidPasswordLength(password)) {
+    throw actionError(`${field} must be between 8 and 72 characters.`);
+  }
+  return password;
+};
+
+const randomCode = (length: number) => {
+  let code = '';
+  while (code.length < length) {
+    code += randomBytes(length).toString('base64url').replace(/[^a-zA-Z0-9]/g, '');
+  }
+  return code.slice(0, length).toUpperCase();
+};
+
+const nextOrderId = () => `ORD-${randomCode(10)}`;
+const nextTicketId = () => `TCK-${randomCode(8)}`;
+const nextAccountId = () => `ACC-${randomCode(6)}`;
+const nextOrderSecret = () => `WS-${randomCode(24)}`;
+const getRequestOrigin = async () => {
+  const requestHeaders = await headers();
+  const requestOrigin = requestHeaders.get('origin');
+  const forwardedHost = requestHeaders.get('x-forwarded-host')?.split(',')[0].trim();
+  const host = forwardedHost || requestHeaders.get('host');
+  const forwardedProtocol = requestHeaders.get('x-forwarded-proto')?.split(',')[0].trim();
+  const protocol = forwardedProtocol || (process.env.NODE_ENV === 'development' ? 'http' : 'https');
+  if (!host) throw actionError('Unable to determine the application URL.');
+
+  // Server Actions can pass through a local proxy while the browser is using
+  // a LAN address (for example, an iPhone testing a local dev server). The
+  // browser Origin is the callback origin that Supabase must return to.
+  if (requestOrigin) {
+    try {
+      const origin = new URL(requestOrigin);
+      if ((origin.protocol === 'http:' || origin.protocol === 'https:') && origin.host === host) {
+        return origin.origin;
+      }
+    } catch {
+      // Fall through to the trusted request host below.
+    }
+  }
+
+  return `${protocol}://${host}`;
+};
+
+const updateProfileClaims = async (authUserId: string, profileId: string, role: UserProfile['role']) => {
+  const { error } = await getSupabaseAdmin().auth.admin.updateUserById(authUserId, {
+    app_metadata: { profile_id: profileId, role: role === 'reseller' ? 'reseller' : 'customer' },
+  });
+  if (error) throw error;
+};
+
+const refreshSessionWithProfileClaims = async (authUserId: string, email: string, password: string, profileId: string, role: UserProfile['role']) => {
+  await updateProfileClaims(authUserId, profileId, role);
+  const authClient = getSupabaseAuth();
+  const { data, error: signInError } = await authClient.auth.signInWithPassword({ email, password });
+  if (signInError || !data.session) throw signInError || new Error('Unable to refresh login session.');
+  await setAuthCookies(data.session);
+};
+const addValidity = (from: Date, value: number, unit: 'days' | 'months') => {
+  const result = new Date(from);
+  if (unit === 'months') {
+    const day = result.getDate();
+    result.setDate(1);
+    result.setMonth(result.getMonth() + value);
+    const lastDay = new Date(result.getFullYear(), result.getMonth() + 1, 0).getDate();
+    result.setDate(Math.min(day, lastDay));
+  } else {
+    result.setDate(result.getDate() + value);
+  }
+  return result;
+};
+
+const mapAccountRow = (row: Record<string, unknown>): AccountCredential => ({
+  id: String(row.id || ''),
+  serviceId: String(row.service_id || ''),
+  serviceTitle: String(row.service_title || ''),
+  username: typeof row.username === 'string' ? row.username : undefined,
+  profileName: typeof row.profile_name === 'string' ? row.profile_name : undefined,
+  password: decryptCredential(row.password),
+  pin: decryptCredential(row.pin),
+  additionalInfo: decryptCredential(row.additional_info),
+  status: row.status === 'assigned' ? 'assigned' : 'available',
+  assignedOrderId: typeof row.assigned_order_id === 'string' ? row.assigned_order_id : undefined,
+  createdAt: String(row.created_at || ''),
+  expiresAt: typeof row.expires_at === 'string' ? row.expires_at : undefined,
+});
+
+const mapTicketWithOrder = (row: Record<string, unknown>, order?: Record<string, unknown>) => mapTicketRow({
+  ...row,
+  customer_whatsapp: row.customer_whatsapp ?? order?.customer_whatsapp,
+  contact_method: row.contact_method ?? order?.contact_method,
+});
+
+const ADMIN_TICKET_PAGE_SIZE = 10;
+const ADMIN_ORDER_PAGE_SIZE = 10;
+const CUSTOMER_PAGE_SIZE = 10;
+
+const sanitizeTicketSearch = (value: unknown) => typeof value === 'string'
+  ? value.trim().replace(/[\\%_,()]/g, '').slice(0, 100)
+  : '';
+
+const applyTicketSearch = <T extends { or: (filters: string) => T }>(query: T, search: string) => {
+  if (!search) return query;
+  return query.or(`id.ilike.%${search}%,customer_telegram.ilike.%${search}%,order_id.ilike.%${search}%`);
+};
+
+const sanitizeOrderSearch = (value: unknown) => typeof value === 'string'
+  ? value.trim().replace(/[\\%_,()]/g, '').slice(0, 100)
+  : '';
+
+// Searches fulfilled orders by order ID, account ID, or the customer's account email.
+const applyOrderSearch = <T extends { or: (filters: string) => T; ilike: (col: string, pattern: string) => T }>(query: T, search: string) => {
+  if (!search) return query;
+  return query.or(`id.ilike.%${search}%,account_id.ilike.%${search}%,customer_telegram.ilike.%${search}%`);
+};
+
+export async function beginGoogleSignInAction(): Promise<ActionResult<{ url: string }>> {
+  try {
+    const cookieStore = await cookies();
+    const redirectTo = `${await getRequestOrigin()}/auth/callback`;
+    const { data, error } = await getSupabaseAuth({
+      flowType: 'pkce',
+      storage: createOAuthCookieStorage(cookieStore),
+    }).auth.signInWithOAuth({
+      provider: 'google',
+      options: {
+        redirectTo,
+        skipBrowserRedirect: true,
+        queryParams: { prompt: 'select_account' },
+      },
+    });
+
+    if (error || !data.url) throw actionError('Google sign-in is unavailable right now. Please try again.');
+    return { ok: true, data: { url: data.url } };
+  } catch (error) {
+    return fail(error);
+  }
+}
+
+// Supabase sends the OAuth code to the configured redirect URL. This action
+// also handles the Site URL fallback for projects whose redirect allow-list is
+// not yet complete, so the browser does not lose a valid PKCE sign-in.
+export async function completeGoogleOAuthAction(code: string): Promise<ActionResult> {
+  try {
+    const authCode = asString(code, 'OAuth code');
+    if (authCode.length > 2_000) throw actionError('Google sign-in could not be completed. Please try again.');
+
+    const cookieStore = await cookies();
+    const { data, error } = await getSupabaseAuth({
+      flowType: 'pkce',
+      storage: createOAuthCookieStorage(cookieStore),
+    }).auth.exchangeCodeForSession(authCode);
+
+    if (error || !data.session) throw actionError('Google sign-in could not be completed. Please try again.');
+    await setAuthCookies(data.session);
+    return { ok: true, data: null };
+  } catch (error) {
+    return fail(error);
+  }
+}
+
+// PKCE is the normal browser flow. This only supports an implicit callback
+// when a Supabase project is still configured to return tokens in the URL
+// fragment, so users do not silently land in an anonymous application state.
+export async function completeGoogleImplicitOAuthAction(input: {
+  accessToken: string;
+  refreshToken: string;
+}): Promise<ActionResult> {
+  try {
+    const accessToken = asString(input.accessToken, 'OAuth access token');
+    const refreshToken = asString(input.refreshToken, 'OAuth refresh token');
+    if (accessToken.length > 8_000 || refreshToken.length > 8_000) {
+      throw actionError('Google sign-in could not be completed. Please try again.');
+    }
+
+    const { data, error } = await getSupabaseAuth({ flowType: 'implicit' }).auth.setSession({
+      access_token: accessToken,
+      refresh_token: refreshToken,
+    });
+    if (error || !data.session) throw actionError('Google sign-in could not be completed. Please try again.');
+
+    await setAuthCookies(data.session);
+    return { ok: true, data: null };
+  } catch (error) {
+    console.error('Google implicit OAuth completion failed:', error);
+    return fail(error);
+  }
+}
+
+export async function getBootstrapDataAction(): Promise<ActionResult<{
+  profile: UserProfile | null;
+  profileCompletionRequired: boolean;
+  profileDraft: { fullName: string; email: string } | null;
+  services: Service[];
+  orders: ReturnType<typeof mapOrderRow>[];
+  tickets: ReturnType<typeof mapTicketRow>[];
+  users: UserProfile[];
+  accounts: AccountCredential[];
+  fulfilledTotal: number;
+  userTotal: number;
+}>> {
+  try {
+    const supabase = getSupabaseAdmin();
+    const sessionUser = await getCurrentSessionUser();
+    let profile = await getCurrentProfile() || (!sessionUser ? await refreshCurrentSession() : null);
+
+    // Allow an allowlisted admin to enter through Google without requiring a
+    // customer contact field; customer OAuth accounts complete contacts below.
+    if (!profile && sessionUser && isAdminEmail(sessionUser.email)) {
+      const adminProfile = await getOrCreateProfileForAuthUser({
+        fullName: sessionUser.fullName || 'Webscribe Admin',
+        email: sessionUser.email,
+        telegram: '@admin',
+        authUserId: sessionUser.authUserId,
+      });
+      await supabase.auth.admin.updateUserById(sessionUser.authUserId, {
+        user_metadata: {
+          full_name: adminProfile.fullName,
+          telegram: adminProfile.telegram,
+          whatsapp: adminProfile.whatsapp || '',
+        },
+      });
+      await updateProfileClaims(sessionUser.authUserId, adminProfile.id, adminProfile.role);
+      profile = (await refreshCurrentSession()) || { ...adminProfile, role: 'admin' };
+    }
+
+    if (!profile) {
+      const { data, error } = await supabase
+        .from('services')
+        .select('*')
+        .eq('is_active', true)
+        .order('is_popular', { ascending: false })
+        .order('title', { ascending: true });
+      if (error) throw error;
+      return {
+        ok: true,
+        data: {
+          profile: null,
+          profileCompletionRequired: Boolean(sessionUser),
+          profileDraft: sessionUser ? {
+            fullName: sessionUser.fullName || 'Google Customer',
+            email: sessionUser.email,
+          } : null,
+          services: (data || []).map(mapServiceRow),
+          orders: [],
+          tickets: [],
+          users: [],
+          accounts: [],
+          fulfilledTotal: 0,
+          userTotal: 0,
+        },
+      };
+    }
+
+    if (profile.role === 'admin' || isAdminEmail(profile.email)) {
+      const [orders, services, accounts, fulfilledCount, userCount] = await Promise.all([
+        supabase.from('orders').select('*').neq('payment_status', 'completed').or(`expires_at.is.null,expires_at.gt.${new Date().toISOString()}`).order('created_at', { ascending: false }),
+        supabase.from('services').select('*').eq('is_active', true).order('title', { ascending: true }),
+        supabase.from('account_credentials').select('*').eq('status', 'available').gt('expires_at', new Date().toISOString()).order('created_at', { ascending: false }),
+        supabase.from('orders').select('id', { count: 'exact', head: true }).eq('payment_status', 'completed'),
+        supabase.from('profiles').select('id', { count: 'exact', head: true }),
+      ]);
+      for (const result of [orders, services, accounts, fulfilledCount, userCount]) {
+        if (result.error) throw result.error;
+      }
+      return {
+        ok: true,
+        data: {
+          profile,
+          profileCompletionRequired: false,
+          profileDraft: null,
+          services: (services.data || []).map(mapServiceRow),
+          orders: (orders.data || []).map(mapOrderRow),
+          tickets: [],
+          users: [],
+          accounts: (accounts.data || []).map(row => mapAccountRow(row as Record<string, unknown>)),
+          fulfilledTotal: fulfilledCount.count || 0,
+          userTotal: userCount.count || 0,
+        },
+      };
+    }
+
+    const { data: services, error: servicesError } = await supabase
+      .from('services')
+      .select('*')
+      .eq('is_active', true)
+      .order('is_popular', { ascending: false })
+      .order('title', { ascending: true });
+    if (servicesError) throw servicesError;
+
+    return {
+      ok: true,
+      data: {
+        profile,
+        profileCompletionRequired: false,
+        profileDraft: null,
+        services: (services || []).map(mapServiceRow),
+        orders: [],
+        tickets: [],
+        users: [profile],
+        accounts: [],
+        fulfilledTotal: 0,
+        userTotal: 0,
+      },
+    };
+
+  } catch (error) {
+    return fail(error);
+  }
+}
+
+const getOrCreateProfileForAuthUser = async (input: {
+  fullName: string;
+  email: string;
+  telegram?: string;
+  whatsapp?: string;
+  authUserId: string;
+}): Promise<UserProfile> => {
+  const supabase = getSupabaseAdmin();
+  const email = normalizeInputEmail(input.email);
+  const authUserId = asString(input.authUserId, 'authUserId');
+  const { data: existing, error: readError } = await supabase
+    .from('profiles')
+    .select('*')
+    .eq('email', email)
+    .maybeSingle();
+
+  if (readError) throw readError;
+  if (existing) {
+    if (existing.auth_user_id && existing.auth_user_id !== authUserId) {
+      throw new Error('Profile ownership mismatch.');
+    }
+    if (!existing.auth_user_id) {
+      const { data, error } = await supabase
+        .from('profiles')
+        .update({ auth_user_id: authUserId })
+        .eq('id', existing.id)
+        .select('*')
+        .single();
+      if (error) throw error;
+      return mapProfileRow(data);
+    }
+    return mapProfileRow(existing);
+  }
+
+  const telegram = normalizeTelegram(input.telegram);
+  const whatsapp = normalizeWhatsapp(input.whatsapp);
+  if (!telegram && !whatsapp) throw actionError('Telegram username or WhatsApp number is required.');
+  const { data, error } = await supabase
+    .from('profiles')
+    .insert({
+      auth_user_id: authUserId,
+      full_name: normalizeFullName(input.fullName),
+      email,
+      telegram: telegram || '',
+      whatsapp: whatsapp || null,
+      role: 'customer',
+    })
+    .select('*')
+    .single();
+
+  if (error) throw error;
+  return mapProfileRow(data);
+};
+
+export async function completeGoogleProfileAction(input: {
+  telegram?: string;
+  whatsapp?: string;
+}): Promise<ActionResult<UserProfile>> {
+  try {
+    const sessionUser = await getCurrentSessionUser();
+    if (!sessionUser) throw new Error('Authentication required.');
+
+    const existingProfile = await getCurrentProfile();
+    if (existingProfile) return { ok: true, data: existingProfile };
+
+    const profile = await getOrCreateProfileForAuthUser({
+      fullName: sessionUser.fullName || 'Google Customer',
+      email: sessionUser.email,
+      telegram: isAdminEmail(sessionUser.email) ? '@admin' : input.telegram,
+      whatsapp: input.whatsapp,
+      authUserId: sessionUser.authUserId,
+    });
+    const supabase = getSupabaseAdmin();
+    const { error: metadataError } = await supabase.auth.admin.updateUserById(sessionUser.authUserId, {
+      user_metadata: {
+        full_name: profile.fullName,
+        telegram: profile.telegram,
+        whatsapp: profile.whatsapp || '',
+      },
+    });
+    if (metadataError) throw metadataError;
+    await updateProfileClaims(sessionUser.authUserId, profile.id, profile.role);
+
+    const refreshedProfile = await refreshCurrentSession();
+    if (!refreshedProfile) throw new Error('Unable to finish profile setup.');
+    revalidatePath('/');
+    return { ok: true, data: isAdminEmail(refreshedProfile.email) ? { ...refreshedProfile, role: 'admin' } : refreshedProfile };
+  } catch (error) {
+    return fail(error);
+  }
+}
+
+export async function registerProfileAction(input: {
+  fullName: string;
+  email: string;
+  telegram?: string;
+  whatsapp?: string;
+  password: string;
+}): Promise<ActionResult<{ profile: UserProfile | null; requiresEmailConfirmation: boolean }>> {
+  try {
+    const supabase = getSupabaseAdmin();
+    const email = normalizeInputEmail(input.email);
+    const password = validateUserPassword(input.password);
+    const fullName = normalizeFullName(input.fullName);
+    const telegram = normalizeTelegram(input.telegram);
+    const whatsapp = normalizeWhatsapp(input.whatsapp);
+    if (!telegram && !whatsapp) throw actionError('Telegram username or WhatsApp number is required.');
+
+    if (isAdminEmail(email)) {
+      throw actionError('Admin accounts cannot be created from customer registration.');
+    }
+
+    const { data: existingProfile, error: profileReadError } = await supabase
+      .from('profiles')
+      .select('id')
+      .eq('email', email)
+      .maybeSingle();
+
+    if (profileReadError) throw profileReadError;
+    if (existingProfile) throw actionError('A profile already exists for this email.');
+
+    const normalizedTelegram = telegram || '';
+    const { data: authData, error: authError } = await getSupabaseAuth().auth.signUp({
+      email,
+      password,
+      options: {
+        data: {
+          full_name: fullName,
+          telegram: telegram ? normalizedTelegram : '',
+          whatsapp: whatsapp || null,
+        },
+      },
+    });
+
+    if (authError) {
+      throw actionError(authError.message.toLowerCase().includes('already')
+        ? 'An account already exists for this email.'
+        : 'Unable to create the account. Please check the details and try again.');
+    }
+    if (!authData.user) throw new Error('Unable to create authentication user.');
+    if (!authData.session) {
+      return { ok: true, data: { profile: null, requiresEmailConfirmation: true } };
+    }
+
+    try {
+      const profile = await getOrCreateProfileForAuthUser({
+        fullName,
+        email,
+        telegram: telegram ? normalizedTelegram : undefined,
+        whatsapp,
+        authUserId: authData.user.id,
+      });
+      await refreshSessionWithProfileClaims(authData.user.id, email, password, profile.id, profile.role);
+      return { ok: true, data: { profile, requiresEmailConfirmation: false } };
+    } catch (error) {
+      await supabase.from('profiles').delete().eq('auth_user_id', authData.user.id);
+      await supabase.auth.admin.deleteUser(authData.user.id);
+      throw error;
+    }
+  } catch (error) {
+    return fail(error);
+  }
+}
+
+export async function loginAction(input: {
+  email: string;
+  password: string;
+}): Promise<ActionResult<UserProfile>> {
+  try {
+    const supabase = getSupabaseAdmin();
+    const email = normalizeInputEmail(input.email);
+    const password = asString(input.password, 'password');
+
+    const authClient = getSupabaseAuth();
+    let signIn = await authClient.auth.signInWithPassword({ email, password });
+
+    const configuredAdminPassword = getAdminPassword();
+    if (signIn.error && isAdminEmail(email) && configuredAdminPassword && password === configuredAdminPassword) {
+      const created = await supabase.auth.admin.createUser({
+        email,
+        password,
+        email_confirm: true,
+        user_metadata: { full_name: 'Webscribe Admin', telegram: '@admin' },
+      });
+
+      if (created.error && !created.error.message.toLowerCase().includes('already')) {
+        throw created.error;
+      }
+
+      signIn = await authClient.auth.signInWithPassword({ email, password });
+    }
+
+    if (signIn.error) throw actionError('Invalid email or password.');
+    if (!signIn.data.user?.email || !signIn.data.session) {
+      throw new Error('Unable to create login session.');
+    }
+
+    const profile = await getOrCreateProfileForAuthUser({
+      fullName: String(signIn.data.user.user_metadata?.full_name || (isAdminEmail(email) ? 'Webscribe Admin' : 'Webscribe Customer')),
+      email,
+      telegram: String(signIn.data.user.user_metadata?.telegram || (isAdminEmail(email) ? '@admin' : '')),
+      whatsapp: typeof signIn.data.user.user_metadata?.whatsapp === 'string' ? signIn.data.user.user_metadata.whatsapp : undefined,
+      authUserId: signIn.data.user.id,
+    });
+
+    const expectedClaimRole = profile.role === 'reseller' ? 'reseller' : 'customer';
+    const metadata = signIn.data.user.app_metadata || {};
+    const userMetadata = signIn.data.user.user_metadata || {};
+    const userMetadataMatches = userMetadata.full_name === profile.fullName
+      && String(userMetadata.telegram || '') === profile.telegram
+      && String(userMetadata.whatsapp || '') === String(profile.whatsapp || '');
+    if (!userMetadataMatches) {
+      const { error: metadataError } = await supabase.auth.admin.updateUserById(signIn.data.user.id, {
+        user_metadata: { full_name: profile.fullName, telegram: profile.telegram, whatsapp: profile.whatsapp || '' },
+      });
+      if (metadataError) throw metadataError;
+    }
+    if (metadata.profile_id === profile.id && metadata.role === expectedClaimRole && userMetadataMatches) {
+      await setAuthCookies(signIn.data.session);
+    } else {
+      await refreshSessionWithProfileClaims(signIn.data.user.id, email, password, profile.id, profile.role);
+    }
+    return { ok: true, data: isAdminEmail(email) ? { ...profile, role: 'admin' as const } : profile };
+  } catch (error) {
+    return fail(error);
+  }
+}
+
+export async function logoutAction(): Promise<ActionResult<{ loggedOut: true }>> {
+  try {
+    await revokeCurrentSession();
+    return { ok: true, data: { loggedOut: true } };
+  } catch (error) {
+    return fail(error);
+  }
+}
+
+export async function searchProfilesAction(query: string): Promise<ActionResult<UserProfile[]>> {
+  try {
+    await requireCurrentAdmin();
+    const search = asString(query, 'search').replace(/[%,()]/g, ' ').trim();
+    if (!search) return { ok: true, data: [] };
+    const supabase = getSupabaseAdmin();
+    const { data, error } = await supabase
+      .from('profiles')
+      .select('*')
+      .or(`email.ilike.%${search}%,telegram.ilike.%${search}%`)
+      .order('created_at', { ascending: false })
+      .limit(20);
+
+    if (error) throw error;
+    return { ok: true, data: (data || []).map(mapProfileRow) };
+  } catch (error) {
+    return fail(error);
+  }
+}
+
+export async function updateProfileRoleAction(input: {
+  adminEmail: string;
+  profileId: string;
+  role: UserProfile['role'];
+}): Promise<ActionResult<UserProfile>> {
+  try {
+    await requireCurrentAdmin();
+    const role = input.role === 'reseller' ? 'reseller' : 'customer';
+    const supabase = getSupabaseAdmin();
+    const { data, error } = await supabase
+      .from('profiles')
+      .update({ role })
+      .eq('id', asString(input.profileId, 'profileId'))
+      .select('*')
+      .single();
+
+    if (error) throw error;
+    if (data.auth_user_id) {
+      const { error: authError } = await supabase.auth.admin.updateUserById(data.auth_user_id, {
+        app_metadata: { profile_id: data.id, role },
+      });
+      if (authError) throw authError;
+    }
+    revalidatePath('/admin');
+    return { ok: true, data: mapProfileRow(data) };
+  } catch (error) {
+    return fail(error);
+  }
+}
+
+export async function updateOwnProfileAction(input: { telegram?: string; whatsapp?: string; oldPassword?: string; newPassword?: string }): Promise<ActionResult<UserProfile>> {
+  try {
+    const current = await requireCurrentProfile();
+    const sessionUser = await getCurrentSessionUser();
+    if (!sessionUser) throw new Error('Authentication required.');
+    const telegram = normalizeTelegram(input.telegram);
+    const whatsapp = normalizeWhatsapp(input.whatsapp);
+    if (!telegram && !whatsapp) throw actionError('Telegram username or WhatsApp number is required.');
+    const supabase = getSupabaseAdmin();
+    if (input.newPassword) {
+      const oldPassword = asString(input.oldPassword, 'oldPassword');
+      const verified = await getSupabaseAuth().auth.signInWithPassword({ email: current.email, password: oldPassword });
+      if (verified.error) throw actionError('Old password is incorrect.');
+      validateUserPassword(input.newPassword, 'New password');
+      const { error } = await supabase.auth.admin.updateUserById(sessionUser.authUserId, { password: input.newPassword });
+      if (error) throw error;
+    }
+    const { data, error } = await supabase.from('profiles').update({ telegram: telegram || '', whatsapp: whatsapp || null }).eq('id', current.id).select('*').single();
+    if (error) throw error;
+    const { error: metadataError } = await supabase.auth.admin.updateUserById(sessionUser.authUserId, { user_metadata: { full_name: current.fullName, telegram: telegram || '', whatsapp: whatsapp || '' } });
+    if (metadataError) throw metadataError;
+    const refreshedProfile = await refreshCurrentSession();
+    revalidatePath('/');
+    return { ok: true, data: refreshedProfile || mapProfileRow(data) };
+  } catch (error) { return fail(error); }
+}
+
+export async function upsertServiceAction(input: {
+  adminEmail: string;
+  service: Service;
+}): Promise<ActionResult<Service>> {
+  try {
+    await requireCurrentAdmin();
+    const supabase = getSupabaseAdmin();
+    const service = input.service;
+    const { data, error } = await supabase
+      .from('services')
+      .upsert({
+        id: asString(service.id, 'service.id'),
+        title: asString(service.title, 'service.title'),
+        category: service.category,
+        logo_url: service.logoUrl || null,
+        brand_color: service.brandColor || '#176b87',
+        description: asOptionalString(service.description) || null,
+        dos: asOptionalString(service.dos) || null,
+        donts: asOptionalString(service.donts) || null,
+        original_price: service.originalPrice ?? service.regularPrice,
+        our_price: service.ourPrice ?? service.regularPrice,
+        regular_price: service.ourPrice ?? service.regularPrice,
+        reseller_price: service.resellerPrice,
+        stock_count: service.stockCount,
+        stock_status: service.stockStatus,
+        validity_value: service.validityValue || 30,
+        validity_unit: service.validityUnit || 'days',
+        variant_mode: service.variantMode || 'single',
+        price_starts_at: service.priceStartsAt ?? null,
+        variants: service.variants || [],
+        is_popular: Boolean(service.isPopular),
+        is_active: true,
+      })
+      .select('*')
+      .single();
+
+    if (error) throw error;
+    revalidatePath('/');
+    revalidatePath('/admin');
+    return { ok: true, data: mapServiceRow(data) };
+  } catch (error) {
+    return fail(error);
+  }
+}
+
+export async function deleteServiceAction(serviceId: string): Promise<ActionResult<null>> {
+  try {
+    await requireCurrentAdmin();
+    const id = asString(serviceId, 'serviceId');
+    const supabase = getSupabaseAdmin();
+    const { count, error: accountError } = await supabase
+      .from('account_credentials')
+      .select('id', { count: 'exact', head: true })
+      .eq('service_id', id);
+    if (accountError) throw accountError;
+    if (count) throw actionError('Remove or reassign the stored accounts for this service before deleting it.');
+
+    const { count: orderCount, error: orderError } = await supabase
+      .from('orders')
+      .select('id', { count: 'exact', head: true })
+      .eq('service_id', id);
+    if (orderError) throw orderError;
+
+    const { error } = orderCount
+      ? await supabase.from('services').update({ is_active: false }).eq('id', id)
+      : await supabase.from('services').delete().eq('id', id);
+    if (error) throw error;
+    revalidatePath('/');
+    revalidatePath('/admin');
+    return { ok: true, data: null };
+  } catch (error) {
+    return fail(error);
+  }
+}
+
+export async function updateServiceStockAction(input: {
+  adminEmail: string;
+  serviceId: string;
+  stockCount: number;
+}): Promise<ActionResult<Service>> {
+  try {
+    await requireCurrentAdmin();
+    const stockCount = Math.max(0, Math.floor(Number(input.stockCount) || 0));
+    const stockStatus = stockCount === 0 ? 'out_of_stock' : stockCount <= 3 ? 'low_stock' : 'in_stock';
+    const supabase = getSupabaseAdmin();
+
+    const { data, error } = await supabase
+      .from('services')
+      .update({ stock_count: stockCount, stock_status: stockStatus })
+      .eq('id', asString(input.serviceId, 'serviceId'))
+      .select('*')
+      .single();
+
+    if (error) throw error;
+    revalidatePath('/');
+    revalidatePath('/admin');
+    return { ok: true, data: mapServiceRow(data) };
+  } catch (error) {
+    return fail(error);
+  }
+}
+
+export async function listAccountCredentialsAction(): Promise<ActionResult<AccountCredential[]>> {
+  try {
+    await requireCurrentAdmin();
+    const now = new Date().toISOString();
+    const { data, error } = await getSupabaseAdmin()
+      .from('account_credentials')
+      .select('*')
+      .eq('status', 'available')
+      .gt('expires_at', now)
+      .order('created_at', { ascending: false });
+    if (error) throw error;
+    return { ok: true, data: (data || []).map(row => mapAccountRow(row as Record<string, unknown>)) };
+  } catch (error) { return fail(error); }
+}
+
+export async function searchAccountCredentialsAction(input: { serviceId: string; query: string }): Promise<ActionResult<AccountCredential[]>> {
+  try {
+    await requireCurrentAdmin();
+    const serviceId = asString(input.serviceId, 'serviceId');
+    const query = asString(input.query, 'query').replace(/[%_,()]/g, '').trim();
+    if (!query) throw actionError('Enter an account ID or email to search.');
+    const now = new Date().toISOString();
+    const pattern = `%${query}%`;
+    const { data, error } = await getSupabaseAdmin()
+      .from('account_credentials')
+      .select('*')
+      .eq('service_id', serviceId)
+      .or(`id.ilike.${pattern},username.ilike.${pattern}`)
+      .gt('expires_at', now)
+      .order('created_at', { ascending: false });
+    if (error) throw error;
+    return { ok: true, data: (data || []).map(row => mapAccountRow(row as Record<string, unknown>)) };
+  } catch (error) { return fail(error); }
+}
+
+export async function createAccountCredentialAction(input: {
+  serviceId: string;
+  serviceTitle: string;
+  credentials: { username?: string; password?: string; pin?: string; additionalInfo?: string; profileName?: string; createdAt?: string; expiresAt?: string };
+}): Promise<ActionResult<AccountCredential>> {
+  try {
+    await requireCurrentAdmin();
+    const serviceId = asString(input.serviceId, 'serviceId');
+    const supabase = getSupabaseAdmin();
+    const { data: service, error: serviceError } = await supabase.from('services').select('title').eq('id', serviceId).eq('is_active', true).single();
+    if (serviceError) throw serviceError;
+    const createdAt = asString(input.credentials.createdAt, 'createdAt');
+    const expiresAt = asString(input.credentials.expiresAt, 'expiresAt');
+    const username = normalizeInputEmail(input.credentials.username);
+    const password = asString(input.credentials.password, 'account password');
+    if (Number.isNaN(Date.parse(createdAt)) || Number.isNaN(Date.parse(expiresAt))) throw actionError('Created and expiry dates must be valid.');
+    if (Date.parse(expiresAt) <= Date.parse(createdAt)) throw actionError('Expiry date must be after the created date.');
+    if (Date.parse(expiresAt) <= Date.now()) throw actionError('Expiry date must be in the future.');
+    const { data, error } = await supabase.from('account_credentials').insert({
+      id: nextAccountId(),
+      service_id: serviceId,
+      service_title: service.title,
+      profile_name: asOptionalString(input.credentials.profileName) || null,
+      username,
+      password: encryptCredential(password),
+      pin: encryptCredential(asOptionalString(input.credentials.pin)),
+      additional_info: encryptCredential(asOptionalString(input.credentials.additionalInfo)),
+      created_at: createdAt,
+      expires_at: expiresAt,
+    }).select('*').single();
+    if (error) throw error;
+    revalidatePath('/admin');
+    return { ok: true, data: mapAccountRow(data as Record<string, unknown>) };
+  } catch (error) { return fail(error); }
+}
+
+export async function updateAccountCredentialAction(input: { accountId: string; serviceId: string; serviceTitle: string; credentials: { username?: string; password?: string; pin?: string; additionalInfo?: string; profileName?: string; createdAt?: string; expiresAt?: string } }): Promise<ActionResult<AccountCredential>> {
+  try {
+    await requireCurrentAdmin();
+    const serviceId = asString(input.serviceId, 'serviceId');
+    const supabase = getSupabaseAdmin();
+    const { data: service, error: serviceError } = await supabase.from('services').select('title').eq('id', serviceId).eq('is_active', true).single();
+    if (serviceError) throw serviceError;
+    const createdAt = asString(input.credentials.createdAt, 'createdAt');
+    const expiresAt = asString(input.credentials.expiresAt, 'expiresAt');
+    const username = normalizeInputEmail(input.credentials.username);
+    const password = asString(input.credentials.password, 'account password');
+    if (Number.isNaN(Date.parse(createdAt)) || Number.isNaN(Date.parse(expiresAt))) throw actionError('Created and expiry dates must be valid.');
+    if (Date.parse(expiresAt) <= Date.parse(createdAt)) throw actionError('Expiry date must be after the created date.');
+    if (Date.parse(expiresAt) <= Date.now()) throw actionError('Expiry date must be in the future.');
+    const { data, error } = await supabase.from('account_credentials').update({ service_id: serviceId, service_title: service.title, profile_name: input.credentials.profileName || null, username, password: encryptCredential(password), pin: encryptCredential(asOptionalString(input.credentials.pin)), additional_info: encryptCredential(asOptionalString(input.credentials.additionalInfo)), created_at: createdAt, expires_at: expiresAt }).eq('id', asString(input.accountId, 'accountId')).select('*').single();
+    if (error) throw error;
+    return { ok: true, data: mapAccountRow(data as Record<string, unknown>) };
+  } catch (error) { return fail(error); }
+}
+
+export async function deleteAccountCredentialAction(accountId: string): Promise<ActionResult<null>> {
+  try {
+    await requireCurrentAdmin();
+    const id = asString(accountId, 'accountId');
+    const { data: account, error: lookupError } = await getSupabaseAdmin().from('account_credentials').select('status').eq('id', id).single();
+    if (lookupError) throw lookupError;
+    if (account.status === 'assigned') throw actionError('Assigned accounts cannot be deleted. Reassign the order first.');
+    const { error } = await getSupabaseAdmin().from('account_credentials').delete().eq('id', id);
+    if (error) throw error;
+    revalidatePath('/admin');
+    return { ok: true, data: null };
+  } catch (error) { return fail(error); }
+}
+
+const attachAccountToOrder = async (accountId: string, orderId: string) => {
+  const supabase = getSupabaseAdmin();
+  const { data: order, error: orderError } = await supabase.from('orders').select('*').eq('id', orderId).single();
+  if (orderError) throw orderError;
+  const { data: account, error: accountError } = await supabase.from('account_credentials')
+    .select('*').eq('id', accountId).single();
+  if (accountError) throw accountError;
+  if (!account.expires_at || Date.parse(account.expires_at) <= Date.now()) {
+    throw actionError('This account has expired and cannot be assigned.');
+  }
+  if (account.status === 'assigned' && account.assigned_order_id !== order.id) {
+    throw actionError('This account is already assigned to another order.');
+  }
+  if (account.service_id !== order.service_id) {
+    const sameServiceTitle = String(account.service_title || '').trim().toLowerCase() === String(order.service_title || '').trim().toLowerCase();
+    if (!sameServiceTitle) throw actionError('Account service does not match this order.');
+    const { error: normalizeError } = await supabase.from('account_credentials').update({ service_id: order.service_id, service_title: order.service_title }).eq('id', account.id);
+    if (normalizeError) throw normalizeError;
+  }
+  const encryptedPassword = encryptCredential(account.password);
+  const encryptedPin = encryptCredential(account.pin);
+  const encryptedAdditionalInfo = encryptCredential(account.additional_info);
+  const credentials = { username: account.username, password: encryptedPassword, pin: encryptedPin, additionalInfo: encryptedAdditionalInfo };
+  const alreadyAttached = account.status === 'assigned' && account.assigned_order_id === order.id;
+  if (!alreadyAttached) {
+    const { data: claimed, error: claimError } = await supabase.from('account_credentials').update({ status: 'assigned', assigned_order_id: order.id, password: encryptedPassword, pin: encryptedPin, additional_info: encryptedAdditionalInfo }).eq('id', account.id).eq('status', 'available').select('id').maybeSingle();
+    if (claimError) throw claimError;
+    if (!claimed) throw actionError('This account was already assigned.');
+  } else if (account.password !== encryptedPassword || account.pin !== encryptedPin || account.additional_info !== encryptedAdditionalInfo) {
+    const { error: encryptionError } = await supabase.from('account_credentials').update({ password: encryptedPassword, pin: encryptedPin, additional_info: encryptedAdditionalInfo }).eq('id', account.id);
+    if (encryptionError) throw encryptionError;
+  }
+
+  const { data: updated, error: updateError } = await supabase.from('orders').update({
+    credentials,
+    account_id: account.id,
+    payment_status: order.payment_status,
+    delivery_status: 'pending',
+    expires_at: order.expires_at,
+  }).eq('id', order.id).select('*').single();
+  if (updateError) {
+    if (!alreadyAttached) {
+      await supabase.from('account_credentials').update({ status: 'available', assigned_order_id: null }).eq('id', account.id).eq('assigned_order_id', order.id);
+    }
+    throw updateError;
+  }
+  if (order.account_id && order.account_id !== account.id) {
+    const { error: releaseError } = await supabase
+      .from('account_credentials')
+      .update({ status: 'available', assigned_order_id: null })
+      .eq('id', order.account_id)
+      .eq('assigned_order_id', order.id);
+    if (releaseError) {
+      await supabase.from('orders').update({ account_id: order.account_id, credentials: order.credentials }).eq('id', order.id);
+      if (!alreadyAttached) {
+        await supabase.from('account_credentials').update({ status: 'available', assigned_order_id: null }).eq('id', account.id).eq('assigned_order_id', order.id);
+      }
+      throw releaseError;
+    }
+  }
+  return mapOrderRow(updated);
+};
+
+export async function attachAccountToOrderAction(input: { accountId: string; orderId: string }): Promise<ActionResult<ReturnType<typeof mapOrderRow>>> {
+  try { await requireCurrentAdmin(); return { ok: true, data: await attachAccountToOrder(asString(input.accountId, 'accountId'), asString(input.orderId, 'orderId')) }; }
+  catch (error) { return fail(error); }
+}
+
+export async function updateOrderFulfillmentAction(input: { orderId: string; fulfilled: boolean }): Promise<ActionResult<ReturnType<typeof mapOrderRow>>> {
+  try {
+    await requireCurrentAdmin();
+    const id = asString(input.orderId, 'orderId');
+    const supabase = getSupabaseAdmin();
+    const { data: existing, error: lookupError } = await supabase.from('orders').select('*').eq('id', id).single();
+    if (lookupError) throw lookupError;
+    if (input.fulfilled && !existing.account_id) {
+      throw actionError('Assign an account before marking this order fulfilled.');
+    }
+    if (input.fulfilled && existing.payment_status === 'cancelled') {
+      throw actionError('A rejected order cannot be marked fulfilled.');
+    }
+
+    let expiresAt: string | null = null;
+    if (input.fulfilled) {
+      expiresAt = existing.expires_at || null;
+      if (!expiresAt) {
+        const { data: service } = await supabase.from('services').select('validity_value, validity_unit, variants').eq('id', existing.service_id).maybeSingle();
+        const variants = Array.isArray(service?.variants) ? service.variants as Array<Record<string, unknown>> : [];
+        const selectedVariant = variants.find(variant => String(variant.id ?? '') === String(existing.variant_id ?? ''));
+        const validityValue = Number(selectedVariant?.validityValue ?? selectedVariant?.validity_value ?? service?.validity_value ?? 30);
+        const validityUnit = selectedVariant?.validityUnit === 'months' || selectedVariant?.validity_unit === 'months' || service?.validity_unit === 'months' ? 'months' : 'days';
+        expiresAt = addValidity(new Date(), Math.max(1, validityValue), validityUnit).toISOString();
+      }
+    }
+
+    const { data, error } = await supabase.from('orders').update({
+      payment_status: input.fulfilled ? 'completed' : 'verification_pending',
+      delivery_status: input.fulfilled ? 'delivered' : 'pending',
+      expires_at: expiresAt,
+    }).eq('id', id).select('*').single();
+    if (error) throw error;
+    revalidatePath('/admin');
+    return { ok: true, data: mapOrderRow(data) };
+  } catch (error) { return fail(error); }
+}
+
+export async function createOrderAction(input: {
+  profileId: string;
+  serviceId: string;
+  variantId?: string;
+  contactMethod?: 'telegram' | 'whatsapp';
+  utrNumber: string;
+}): Promise<ActionResult<ReturnType<typeof mapOrderRow>>> {
+  try {
+    const supabase = getSupabaseAdmin();
+    const currentProfile = await requireCurrentProfile();
+    const profileId = asString(input.profileId, 'profileId');
+    const serviceId = asString(input.serviceId, 'serviceId');
+    const utrNumber = asString(input.utrNumber, 'utrNumber');
+    if (!/^\d{12}$/.test(utrNumber)) {
+      throw actionError('Enter a valid 12-digit UPI UTR number.');
+    }
+    if (currentProfile.id !== profileId) {
+      throw new Error('Forbidden: order profile mismatch.');
+    }
+
+    const [{ data: profile, error: profileError }, { data: service, error: serviceError }] = await Promise.all([
+      supabase.from('profiles').select('*').eq('id', profileId).single(),
+      supabase.from('services').select('*').eq('id', serviceId).eq('is_active', true).single(),
+    ]);
+
+    if (profileError) throw profileError;
+    if (serviceError) throw serviceError;
+    if (!profile || !service) throw actionError('Profile or service not found.');
+    if (!profile.telegram && !profile.whatsapp) throw actionError('Add a Telegram username or WhatsApp number to your profile first.');
+    const contactMethod = input.contactMethod === 'whatsapp' ? 'whatsapp' : 'telegram';
+    if (contactMethod === 'telegram' && !profile.telegram) throw actionError('Add a Telegram username before choosing Telegram delivery.');
+    if (contactMethod === 'whatsapp' && !profile.whatsapp) throw actionError('Add a WhatsApp number before choosing WhatsApp delivery.');
+    if (service.stock_count <= 0) throw actionError('Service is out of stock.');
+
+    const userRole = profile.role;
+    const variants = Array.isArray(service.variants) ? service.variants as Array<Record<string, unknown>> : [];
+    const selectedVariant = service.variant_mode === 'multiple'
+      ? variants.find(variant => String(variant.id ?? '') === input.variantId)
+      : undefined;
+    if (service.variant_mode === 'multiple' && !selectedVariant) throw actionError('Select a service variant.');
+    const pricePaid = userRole === 'reseller'
+      ? Number(selectedVariant?.resellerPrice ?? selectedVariant?.reseller_price ?? service.reseller_price)
+      : Number(selectedVariant?.ourPrice ?? selectedVariant?.our_price ?? selectedVariant?.regularPrice ?? service.regular_price);
+    const { data: existingOrder, error: existingOrderError } = await supabase
+      .from('orders')
+      .select('*')
+      .eq('utr_number', utrNumber)
+      .limit(1)
+      .maybeSingle();
+    if (existingOrderError) throw existingOrderError;
+    if (existingOrder) {
+      if (existingOrder.profile_id === profile.id && existingOrder.service_id === service.id) {
+        return { ok: true, data: mapOrderRow(existingOrder) };
+      }
+      throw actionError('This UTR number has already been submitted.');
+    }
+
+    const orderId = nextOrderId();
+    const secretKey = nextOrderSecret();
+
+    const { data: order, error: orderError } = await supabase
+      .from('orders')
+      .insert({
+        id: orderId,
+        secret_key: secretKey,
+        profile_id: profile.id,
+        service_id: service.id,
+        service_title: service.title,
+        dos: service.dos || null,
+        donts: service.donts || null,
+        variant_id: selectedVariant ? String(selectedVariant.id) : null,
+        variant_name: selectedVariant ? String(selectedVariant.name ?? '') : null,
+        service_category: service.category,
+        user_role: userRole,
+        price_paid: pricePaid,
+        regular_price: Number(selectedVariant?.ourPrice ?? selectedVariant?.our_price ?? selectedVariant?.regularPrice ?? service.regular_price),
+        reseller_discount: userRole === 'reseller'
+          ? Number(selectedVariant?.ourPrice ?? selectedVariant?.our_price ?? selectedVariant?.regularPrice ?? service.regular_price) - pricePaid
+          : null,
+        customer_name: profile.full_name,
+        customer_telegram: profile.telegram,
+        customer_whatsapp: profile.whatsapp || null,
+        contact_method: contactMethod,
+        payment_status: 'verification_pending',
+        utr_number: utrNumber,
+        delivery_method: 'instant',
+        delivery_status: 'pending',
+      })
+      .select('*')
+      .single();
+
+    if (orderError) throw orderError;
+
+    const mapped = mapOrderRow(order);
+    await sendTelegramMessage({
+      orderId: mapped.id,
+      message: buildPaymentNotification({
+        id: mapped.id,
+        serviceTitle: service.title,
+        serviceCategory: service.category,
+        serviceDescription: service.description || undefined,
+        customerName: profile.full_name,
+        customerTelegram: mapped.customerTelegram,
+        customerWhatsapp: mapped.customerWhatsapp,
+        contactMethod: mapped.contactMethod,
+        pricePaid: mapped.pricePaid,
+        originalPrice: Number(selectedVariant?.originalPrice ?? selectedVariant?.original_price ?? service.original_price ?? service.regular_price ?? 0),
+        resellerPrice: Number(selectedVariant?.resellerPrice ?? selectedVariant?.reseller_price ?? service.reseller_price ?? 0),
+        userRole: mapped.userRole,
+        secretKey: mapped.secretKey,
+        utrNumber: mapped.utrNumber,
+      }),
+    });
+
+    revalidatePath('/');
+    revalidatePath('/admin');
+    return { ok: true, data: mapped };
+  } catch (error) {
+    return fail(error);
+  }
+}
+
+export async function listCustomerOrdersAction(input: {
+  profileId: string;
+  page?: number;
+}): Promise<ActionResult<CustomerOrderPage>> {
+  try {
+    const supabase = getSupabaseAdmin();
+    const currentProfile = await requireCurrentProfile();
+    const requestedProfileId = asString(input.profileId, 'profileId');
+    if (currentProfile.id !== requestedProfileId) {
+      throw new Error('Forbidden: order profile mismatch.');
+    }
+
+    const expiryFilter = new Date().toISOString();
+    const countQuery = supabase
+      .from('orders')
+      .select('id', { count: 'exact', head: true })
+      .eq('profile_id', requestedProfileId)
+      .or(`expires_at.is.null,expires_at.gt.${expiryFilter}`);
+    const { count, error: countError } = await countQuery;
+    if (countError) throw countError;
+
+    const total = count || 0;
+    const totalPages = Math.max(1, Math.ceil(total / CUSTOMER_PAGE_SIZE));
+    const requestedPage = Number.isFinite(input.page) ? Math.max(1, Math.floor(input.page || 1)) : 1;
+    const page = Math.min(requestedPage, totalPages);
+    const { data, error } = await supabase
+      .from('orders')
+      .select('*')
+      .eq('profile_id', requestedProfileId)
+      .or(`expires_at.is.null,expires_at.gt.${expiryFilter}`)
+      .order('created_at', { ascending: false })
+      .order('id', { ascending: false })
+      .range((page - 1) * CUSTOMER_PAGE_SIZE, page * CUSTOMER_PAGE_SIZE - 1);
+
+    if (error) throw error;
+    return {
+      ok: true,
+      data: {
+        items: (data || []).map(mapOrderRow),
+        page,
+        pageSize: CUSTOMER_PAGE_SIZE,
+        total,
+        totalPages,
+      },
+    };
+  } catch (error) {
+    return fail(error);
+  }
+}
+
+export async function listCustomerTicketsAction(input: {
+  profileId: string;
+  page?: number;
+}): Promise<ActionResult<CustomerTicketPage>> {
+  try {
+    const supabase = getSupabaseAdmin();
+    const currentProfile = await requireCurrentProfile();
+    const requestedProfileId = asString(input.profileId, 'profileId');
+    if (currentProfile.id !== requestedProfileId) {
+      throw new Error('Forbidden: ticket profile mismatch.');
+    }
+
+    const { count, error: countError } = await supabase
+      .from('tickets')
+      .select('id, orders!inner(profile_id)', { count: 'exact', head: true })
+      .eq('orders.profile_id', requestedProfileId);
+    if (countError) throw countError;
+
+    const total = count || 0;
+    const totalPages = Math.max(1, Math.ceil(total / CUSTOMER_PAGE_SIZE));
+    const requestedPage = Number.isFinite(input.page) ? Math.max(1, Math.floor(input.page || 1)) : 1;
+    const page = Math.min(requestedPage, totalPages);
+    const { data, error } = await supabase
+      .from('tickets')
+      .select('*, orders!inner(profile_id, customer_whatsapp, contact_method)')
+      .eq('orders.profile_id', requestedProfileId)
+      .order('created_at', { ascending: false })
+      .order('id', { ascending: false })
+      .range((page - 1) * CUSTOMER_PAGE_SIZE, page * CUSTOMER_PAGE_SIZE - 1);
+    if (error) throw error;
+
+    const items = (data || []).map(row => {
+      const record = row as Record<string, unknown>;
+      const relatedOrder = record.orders && typeof record.orders === 'object' && !Array.isArray(record.orders)
+        ? record.orders as Record<string, unknown>
+        : undefined;
+      return mapTicketWithOrder(record, relatedOrder);
+    });
+    return {
+      ok: true,
+      data: {
+        items,
+        page,
+        pageSize: CUSTOMER_PAGE_SIZE,
+        total,
+        totalPages,
+      },
+    };
+  } catch (error) {
+    return fail(error);
+  }
+}
+
+export async function rejectOrderAction(input: {
+  adminEmail: string;
+  orderId: string;
+  reason?: 'payment' | 'stock';
+}): Promise<ActionResult<ReturnType<typeof mapOrderRow>>> {
+  try {
+    await requireCurrentAdmin();
+    const supabase = getSupabaseAdmin();
+    const orderId = asString(input.orderId, 'orderId');
+    const { data: existing, error: readError } = await supabase
+      .from('orders')
+      .select('account_id')
+      .eq('id', orderId)
+      .single();
+    if (readError) throw readError;
+    if (existing.account_id) {
+      const { error: releaseError } = await supabase
+        .from('account_credentials')
+        .update({ status: 'available', assigned_order_id: null })
+        .eq('id', existing.account_id)
+        .eq('assigned_order_id', orderId);
+      if (releaseError) throw releaseError;
+    }
+    const { data, error } = await supabase
+      .from('orders')
+      .update({ payment_status: 'cancelled', delivery_status: 'pending', account_id: null, credentials: null, expires_at: null })
+      .eq('id', orderId)
+      .select('*')
+      .single();
+
+    if (error) {
+      if (existing.account_id) {
+        await supabase
+          .from('account_credentials')
+          .update({ status: 'assigned', assigned_order_id: orderId })
+          .eq('id', existing.account_id)
+          .eq('status', 'available');
+      }
+      throw error;
+    }
+    revalidatePath('/');
+    revalidatePath('/admin');
+    return { ok: true, data: mapOrderRow(data) };
+  } catch (error) {
+    return fail(error);
+  }
+}
+
+export async function createTicketAction(input: {
+  profileId: string;
+  orderId: string;
+  issueCategory: string;
+  description: string;
+}): Promise<ActionResult<ReturnType<typeof mapTicketRow>>> {
+  try {
+    const supabase = getSupabaseAdmin();
+    const currentProfile = await requireCurrentProfile();
+    const profileId = asString(input.profileId, 'profileId');
+    if (currentProfile.id !== profileId) {
+      throw new Error('Forbidden: ticket profile mismatch.');
+    }
+
+    const { data: order, error: orderError } = await supabase
+      .from('orders')
+      .select('*')
+      .eq('id', asString(input.orderId, 'orderId'))
+      .eq('profile_id', profileId)
+      .single();
+
+    if (orderError) throw orderError;
+    if (!order) throw actionError('Order not found.');
+
+    const allowedIssueCategories = ['Account Locked', 'Invalid Password', 'Buffering / Quality', 'Other'];
+    const issueCategory = asString(input.issueCategory, 'issueCategory');
+    if (!allowedIssueCategories.includes(issueCategory)) {
+      throw actionError('Select a valid support issue type.');
+    }
+    const description = asString(input.description, 'description');
+    if (description.length > 1500) {
+      throw actionError('Ticket description must be 1500 characters or fewer.');
+    }
+
+    const ticket = {
+      id: nextTicketId(),
+      order_id: order.id,
+      service_title: order.service_title,
+      customer_telegram: order.customer_telegram,
+      issue_category: issueCategory,
+      description,
+      status: 'open',
+    };
+
+    const { data, error } = await supabase
+      .from('tickets')
+      .insert(ticket)
+      .select('*')
+      .single();
+
+    if (error) throw error;
+    const mapped = mapTicketWithOrder(data as Record<string, unknown>, order as Record<string, unknown>);
+
+    await sendTelegramMessage({
+      ticketId: mapped.id,
+      orderId: mapped.orderId,
+      message: buildTicketNotification(mapped),
+    });
+
+    revalidatePath('/');
+    revalidatePath('/admin');
+    return { ok: true, data: mapped };
+  } catch (error) {
+    return fail(error);
+  }
+}
+
+export async function listAdminTicketsAction(input: {
+  status: 'open' | 'resolved';
+  page?: number;
+  search?: string;
+}): Promise<ActionResult<AdminTicketPage>> {
+  try {
+    await requireCurrentAdmin();
+    const supabase = getSupabaseAdmin();
+    const status = input.status === 'resolved' ? 'resolved' : 'open';
+    const search = sanitizeTicketSearch(input.search);
+
+    let openCountQuery = supabase
+      .from('tickets')
+      .select('id', { count: 'exact', head: true })
+      .neq('status', 'resolved');
+    let resolvedCountQuery = supabase
+      .from('tickets')
+      .select('id', { count: 'exact', head: true })
+      .eq('status', 'resolved');
+
+    if (status === 'open' && search) openCountQuery = applyTicketSearch(openCountQuery, search);
+    if (status === 'resolved' && search) resolvedCountQuery = applyTicketSearch(resolvedCountQuery, search);
+
+    const [openCount, resolvedCount] = await Promise.all([openCountQuery, resolvedCountQuery]);
+    if (openCount.error) throw openCount.error;
+    if (resolvedCount.error) throw resolvedCount.error;
+
+    const openTotal = openCount.count || 0;
+    const resolvedTotal = resolvedCount.count || 0;
+    const total = status === 'open' ? openTotal : resolvedTotal;
+    const totalPages = Math.max(1, Math.ceil(total / ADMIN_TICKET_PAGE_SIZE));
+    const requestedPage = Number.isFinite(input.page) ? Math.max(1, Math.floor(input.page || 1)) : 1;
+    const page = Math.min(requestedPage, totalPages);
+
+    let ticketQuery = supabase
+      .from('tickets')
+      .select('*')
+      .order('created_at', { ascending: false })
+      .order('id', { ascending: false });
+    ticketQuery = status === 'resolved'
+      ? ticketQuery.eq('status', 'resolved')
+      : ticketQuery.neq('status', 'resolved');
+    ticketQuery = applyTicketSearch(ticketQuery, search);
+
+    const { data, error } = await ticketQuery.range(
+      (page - 1) * ADMIN_TICKET_PAGE_SIZE,
+      page * ADMIN_TICKET_PAGE_SIZE - 1,
+    );
+    if (error) throw error;
+
+    const rows = (data || []) as Array<Record<string, unknown>>;
+    const orderIds = rows.map(row => row.order_id).filter((id): id is string => typeof id === 'string' && Boolean(id));
+    const { data: orders, error: ordersError } = orderIds.length
+      ? await supabase.from('orders').select('id, customer_whatsapp, contact_method').in('id', orderIds)
+      : { data: [], error: null };
+    if (ordersError) throw ordersError;
+
+    const orderById = new Map((orders || []).map(order => [order.id, order as Record<string, unknown>]));
+    return {
+      ok: true,
+      data: {
+        items: rows.map(row => mapTicketWithOrder(row, orderById.get(row.order_id))),
+        page,
+        pageSize: ADMIN_TICKET_PAGE_SIZE,
+        total,
+        totalPages,
+        status,
+        search,
+        openTotal,
+        resolvedTotal,
+      },
+    };
+  } catch (error) {
+    return fail(error);
+  }
+}
+
+export async function listAdminFulfilledOrdersAction(input: {
+  page?: number;
+  serviceTitle?: string;
+  search?: string;
+}): Promise<ActionResult<AdminOrderPage>> {
+  try {
+    await requireCurrentAdmin();
+    const supabase = getSupabaseAdmin();
+    const serviceTitle = typeof input.serviceTitle === 'string' && input.serviceTitle.trim() && input.serviceTitle !== 'all'
+      ? input.serviceTitle.trim().slice(0, 200)
+      : '';
+    const search = sanitizeOrderSearch(input.search);
+
+    let countQuery = supabase
+      .from('orders')
+      .select('id', { count: 'exact', head: true })
+      .eq('payment_status', 'completed');
+    if (serviceTitle) countQuery = countQuery.eq('service_title', serviceTitle);
+    countQuery = applyOrderSearch(countQuery, search);
+
+    const [countResult, serviceResult] = await Promise.all([
+      countQuery,
+      supabase.from('orders').select('service_title').eq('payment_status', 'completed').order('service_title', { ascending: true }),
+    ]);
+    if (countResult.error) throw countResult.error;
+    if (serviceResult.error) throw serviceResult.error;
+
+    const total = countResult.count || 0;
+    const totalPages = Math.max(1, Math.ceil(total / ADMIN_ORDER_PAGE_SIZE));
+    const requestedPage = Number.isFinite(input.page) ? Math.max(1, Math.floor(input.page || 1)) : 1;
+    const page = Math.min(requestedPage, totalPages);
+    let orderQuery = supabase
+      .from('orders')
+      .select('*')
+      .eq('payment_status', 'completed')
+      .order('created_at', { ascending: false })
+      .order('id', { ascending: false });
+    if (serviceTitle) orderQuery = orderQuery.eq('service_title', serviceTitle);
+    orderQuery = applyOrderSearch(orderQuery, search);
+
+    const { data, error } = await orderQuery.range(
+      (page - 1) * ADMIN_ORDER_PAGE_SIZE,
+      page * ADMIN_ORDER_PAGE_SIZE - 1,
+    );
+    if (error) throw error;
+
+    return {
+      ok: true,
+      data: {
+        items: (data || []).map(mapOrderRow),
+        page,
+        pageSize: ADMIN_ORDER_PAGE_SIZE,
+        total,
+        totalPages,
+        serviceTitle: serviceTitle || 'all',
+        search,
+        serviceTypes: Array.from(new Set((serviceResult.data || []).map(row => row.service_title).filter((title): title is string => typeof title === 'string' && Boolean(title)))),
+      },
+    };
+  } catch (error) {
+    return fail(error);
+  }
+}
+
+export async function resolveTicketAction(input: {
+  adminEmail: string;
+  ticketId: string;
+  adminNote?: string;
+}): Promise<ActionResult<ReturnType<typeof mapTicketRow>>> {
+  try {
+    await requireCurrentAdmin();
+    const supabase = getSupabaseAdmin();
+    const { data, error } = await supabase
+      .from('tickets')
+      .update({
+        status: 'resolved',
+        admin_note: asOptionalString(input.adminNote) || 'Resolved by admin.',
+      })
+      .eq('id', asString(input.ticketId, 'ticketId'))
+      .select('*')
+      .single();
+
+    if (error) throw error;
+    revalidatePath('/');
+    revalidatePath('/admin');
+    const { data: order, error: orderError } = await supabase
+      .from('orders')
+      .select('customer_whatsapp, contact_method')
+      .eq('id', data.order_id)
+      .maybeSingle();
+    if (orderError) throw orderError;
+    return { ok: true, data: mapTicketWithOrder(data as Record<string, unknown>, order as Record<string, unknown> | undefined) };
+  } catch (error) {
+    return fail(error);
+  }
+}
+
+export async function listAdminDashboardAction() {
+  try {
+    await requireCurrentAdmin();
+    const supabase = getSupabaseAdmin();
+    const [orders, services, fulfilledCount, userCount] = await Promise.all([
+      supabase.from('orders').select('*').neq('payment_status', 'completed').or(`expires_at.is.null,expires_at.gt.${new Date().toISOString()}`).order('created_at', { ascending: false }),
+      supabase.from('services').select('*').eq('is_active', true).order('title', { ascending: true }),
+      supabase.from('orders').select('id', { count: 'exact', head: true }).eq('payment_status', 'completed'),
+      supabase.from('profiles').select('id', { count: 'exact', head: true }),
+    ]);
+
+    for (const result of [orders, services, fulfilledCount, userCount]) {
+      if (result.error) throw result.error;
+    }
+
+    return {
+      ok: true as const,
+      data: {
+        orders: (orders.data || []).map(mapOrderRow),
+        tickets: [],
+        users: [],
+        services: (services.data || []).map(mapServiceRow),
+        fulfilledTotal: fulfilledCount.count || 0,
+        userTotal: userCount.count || 0,
+      },
+    };
+  } catch (error) {
+    return fail(error);
+  }
+}

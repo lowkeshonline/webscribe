@@ -1,36 +1,39 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Webscribe
 
-## Getting Started
+Webscribe is a Next.js storefront and operations dashboard for subscription-service inventory, semi-automated UPI verification, account assignment, customer delivery, reseller roles, and support tickets.
 
-First, run the development server:
+## Local development
+
+Create `.env.local` from `.env.example`, configure the required values, then run:
 
 ```bash
+npm install
 npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Open `http://localhost:3000`.
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+## Database
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+For a new Supabase project, run `supabase/schema.sql` in the SQL editor. For an existing project, run the dated migrations in order, including `supabase/migrations/20260912_production_hardening.sql` before production deployment.
 
-## Learn More
+The application accesses Supabase only from authenticated server actions through the service-role client. Never expose `SUPABASE_SERVICE_ROLE_KEY` through a `NEXT_PUBLIC_` variable.
 
-To learn more about Next.js, take a look at the following resources:
+## Vercel deployment
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+1. Import this repository into Vercel as a Next.js project.
+2. Add every variable from `.env.example` to the Production environment.
+3. In Supabase Auth URL Configuration, set the Site URL to the production Vercel domain and enable email confirmation for public registration.
+4. Use a strong, unique `ADMIN_PASSWORD` only if you retain password login for the administrator. Generate `CREDENTIAL_ENCRYPTION_KEY` once with `openssl rand -base64 32`, store it securely, and keep the same value across deployments.
+5. Configure Google OAuth in Supabase Auth and add the application callback URL described in `supabase/README.md`.
+6. Deploy and verify customer registration, Google/admin login, payment submission, Telegram admin notification, account assignment, fulfillment, and ticket creation.
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+Run the local production checks before pushing:
 
-## Deploy on Vercel
+```bash
+npm run lint
+npx tsc --noEmit
+npm run build
+```
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+Detailed database and backend notes are in `supabase/README.md`; the current architecture and implementation history are in `system_design.md`.
