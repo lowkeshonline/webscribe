@@ -21,6 +21,14 @@ const optionalStr = (row: DbRecord, key: string) => {
   const value = row[key];
   return typeof value === 'string' && value ? value : undefined;
 };
+
+/** Legacy plan variants stored their details in dos/donts before the description field existed. */
+const legacyPlanDescription = (variant: DbRecord) => {
+  const points = [optionalStr(variant, 'dos'), optionalStr(variant, 'donts')]
+    .filter((text): text is string => Boolean(text))
+    .flatMap(text => text.split(/\r?\n/).map(point => point.trim()).filter(Boolean));
+  return points.length ? Array.from(new Set(points)).join('\n') : undefined;
+};
 const num = (row: DbRecord, key: string) => Number(row[key] ?? 0);
 const bool = (row: DbRecord, key: string) => Boolean(row[key]);
 export const mapServiceRow = (row: DbRecord): Service => ({
@@ -32,6 +40,7 @@ export const mapServiceRow = (row: DbRecord): Service => ({
   description: str(row, 'description'),
   dos: optionalStr(row, 'dos'),
   donts: optionalStr(row, 'donts'),
+  deliveryTime: optionalStr(row, 'delivery_time'),
   regularPrice: num(row, 'our_price') || num(row, 'regular_price'),
   originalPrice: num(row, 'original_price') || num(row, 'regular_price'),
   ourPrice: num(row, 'our_price') || num(row, 'regular_price'),
@@ -54,6 +63,10 @@ export const mapServiceRow = (row: DbRecord): Service => ({
       stockCount: Number(item.stockCount ?? item.stock_count ?? 0),
       validityValue: Number(item.validityValue ?? item.validity_value ?? 30),
       validityUnit: item.validityUnit === 'months' || item.validity_unit === 'months' ? 'months' : 'days',
+      deliveryTime: optionalStr(item, 'deliveryTime') ?? optionalStr(item, 'delivery_time'),
+      description: optionalStr(item, 'description') ?? legacyPlanDescription(item),
+      dos: optionalStr(item, 'dos'),
+      donts: optionalStr(item, 'donts'),
     };
   }) : [],
   isPopular: bool(row, 'is_popular'),

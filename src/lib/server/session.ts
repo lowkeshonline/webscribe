@@ -1,14 +1,13 @@
 import 'server-only';
 
 import { cookies } from 'next/headers';
-import { Session, SupportedStorage } from '@supabase/supabase-js';
+import { Session } from '@supabase/supabase-js';
 import { getSupabaseAdmin, getSupabaseAuth } from './supabaseAdmin';
 import { isAdminEmail, normalizeEmail } from './authz';
 import { mapProfileRow } from './mappers';
 
 const ACCESS_COOKIE = 'ws_access_token';
 const REFRESH_COOKIE = 'ws_refresh_token';
-const OAUTH_VERIFIER_COOKIE = 'ws_google_oauth_verifier';
 const cookieOptions = {
   httpOnly: true,
   secure: process.env.NODE_ENV === 'production',
@@ -16,25 +15,7 @@ const cookieOptions = {
   path: '/',
 };
 
-type CookieStore = Awaited<ReturnType<typeof cookies>>;
-type CookieWriter = Pick<CookieStore, 'set'>;
-
-// Supabase's PKCE verifier must survive the redirect, but the application
-// keeps the actual auth session in its own HTTP-only cookies.
-export const createOAuthCookieStorage = (cookieStore: CookieStore): SupportedStorage => ({
-  isServer: true,
-  getItem: async key => key.endsWith('-code-verifier')
-    ? cookieStore.get(OAUTH_VERIFIER_COOKIE)?.value || null
-    : null,
-  setItem: async (key, value) => {
-    if (key.endsWith('-code-verifier')) {
-      cookieStore.set(OAUTH_VERIFIER_COOKIE, value, { ...cookieOptions, maxAge: 10 * 60 });
-    }
-  },
-  removeItem: async key => {
-    if (key.endsWith('-code-verifier')) cookieStore.delete(OAUTH_VERIFIER_COOKIE);
-  },
-});
+type CookieWriter = Pick<Awaited<ReturnType<typeof cookies>>, 'set'>;
 
 const writeAuthCookies = (cookieStore: CookieWriter, session: Session) => {
   const maxAge = session.expires_in || 60 * 60 * 24 * 7;
@@ -52,16 +33,6 @@ const writeAuthCookies = (cookieStore: CookieWriter, session: Session) => {
 
 export const setAuthCookies = async (session: Session) => {
   writeAuthCookies(await cookies(), session);
-};
-
-// Route handlers should attach auth cookies directly to the response that
-// performs the redirect. This avoids relying on a second request-cookie store
-// being merged into the redirect response.
-export const setAuthCookiesOnResponse = (response: Response, session: Session) => {
-  if (!('cookies' in response)) {
-    throw new Error('Response does not support cookies.');
-  }
-  writeAuthCookies((response as Response & { cookies: CookieWriter }).cookies, session);
 };
 
 export const clearAuthCookies = async () => {
@@ -87,8 +58,7 @@ export const revokeCurrentSession = async () => {
   const accessToken = (await cookies()).get(ACCESS_COOKIE)?.value;
   try {
     if (accessToken) {
-      const { error } = await getSupabaseAdmin().auth.admin.signOut(accessToken, 'global');
-      if (error) console.error('Unable to revoke Supabase session:', error);
+      await getSupabaseAdmin().auth.admin.signOut(accessToken, 'global');
     }
   } finally {
     await clearAuthCookies();
@@ -127,7 +97,7 @@ export const getCurrentSessionUser = async () => {
   } else {
     // Some Supabase projects still use signing/configuration combinations that
     // cannot be verified locally. Validate the token with Auth before treating
-    // the request as anonymous rather than silently dropping an OAuth session.
+    // the request as anonymous rather than silently dropping a valid session.
     const { data, error } = await authClient.auth.getUser(token);
     if (error || !data.user || typeof data.user.email !== 'string') return null;
     authUserId = data.user.id;
@@ -181,7 +151,7 @@ export const getCurrentProfile = async () => {
   return isAdminEmail(profile.email) ? { ...profile, role: 'admin' as const } : profile;
 };
 
-export const requireCurrentProfile = async () => {
+const requireCurrentProfile = async () => {
   const profile = await getCurrentProfile() || await refreshCurrentSession();
   if (!profile) {
     throw new Error('Authentication required.');

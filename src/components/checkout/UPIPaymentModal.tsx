@@ -6,27 +6,38 @@ import { useApp } from '@/context/AppContext';
 import { Order } from '@/types';
 import { X, Copy, Check, ArrowRight, ShieldCheck, Sparkles } from 'lucide-react';
 import { StyledDropdown } from '@/components/common/StyledDropdown';
+import { HighlightPoints } from '@/components/common/HighlightPoints';
 import { copyTextToClipboard } from '@/lib/client/clipboard';
 import { LoadingButton } from '@/components/common/LoadingButton';
+import {
+  isValidFullName,
+  isValidIndianWhatsappNumber,
+  isValidTelegramUsername,
+  sanitizeFullNameInput,
+  sanitizeIndianWhatsappInput,
+  sanitizeTelegramInput,
+} from '@/lib/validation';
 
 export const UPIPaymentModal: React.FC = () => {
-  const { checkoutService, closeCheckout, currentRole, currentUser, placeOrder, openOrderDetails } = useApp();
+  const { checkoutService, checkoutVariantId, closeCheckout, currentRole, placeOrder } = useApp();
 
   const [step, setStep] = useState<'info' | 'payment' | 'success'>('info');
   const [contactMethod, setContactMethod] = useState<'telegram' | 'whatsapp'>('telegram');
+  const [customerName, setCustomerName] = useState('');
+  const [customerTelegram, setCustomerTelegram] = useState('');
+  const [customerWhatsapp, setCustomerWhatsapp] = useState('');
   const [utrNumber, setUtrNumber] = useState('');
   const [copiedUPI, setCopiedUPI] = useState(false);
   const [activeOrder, setActiveOrder] = useState<Order | null>(null);
   const [uploading, setUploading] = useState(false);
   const [checkoutError, setCheckoutError] = useState<string | null>(null);
-  const [selectedVariantId, setSelectedVariantId] = useState<string | undefined>(checkoutService?.variants?.[0]?.id);
+  const [selectedVariantId, setSelectedVariantId] = useState<string | undefined>(checkoutVariantId ?? checkoutService?.variants?.[0]?.id);
 
   if (!checkoutService) return null;
 
   const isReseller = currentRole === 'reseller';
-  const selectedVariant = checkoutService.variantMode === 'multiple'
-    ? checkoutService.variants?.find(variant => variant.id === selectedVariantId) || checkoutService.variants?.[0]
-    : undefined;
+  const variants = checkoutService.variants || [];
+  const selectedVariant = variants.find(variant => variant.id === selectedVariantId) || variants[0];
   const priceToPay = isReseller
     ? selectedVariant?.resellerPrice ?? checkoutService.resellerPrice
     : selectedVariant?.ourPrice ?? selectedVariant?.regularPrice ?? checkoutService.regularPrice;
@@ -34,6 +45,7 @@ export const UPIPaymentModal: React.FC = () => {
   const backupUpiId = 'lowkeshonline@ybl';
   const upiPaymentUri = `upi://pay?${new URLSearchParams({ pa: upiId, pn: 'Webscribe', am: String(priceToPay), cu: 'INR' })}`;
   const upiQrUrl = `https://api.qrserver.com/v1/create-qr-code/?${new URLSearchParams({ size: '220x220', data: upiPaymentUri })}`;
+  const stepNumber = step === 'info' ? 1 : step === 'payment' ? 2 : 3;
 
   const handleCopyUPI = async () => {
     if (await copyTextToClipboard(upiId)) {
@@ -44,13 +56,16 @@ export const UPIPaymentModal: React.FC = () => {
 
   const handleProceedToPayment = (e: React.FormEvent) => {
     e.preventDefault();
-    const resolvedContact = contactMethod === 'telegram' ? currentUser?.telegram : currentUser?.whatsapp;
-    if (!resolvedContact?.trim()) {
-      setCheckoutError(
-        contactMethod === 'telegram'
-          ? 'Add a Telegram username to your profile before choosing Telegram delivery.'
-          : 'Add a WhatsApp number to your profile before choosing WhatsApp delivery.'
-      );
+    if (!isValidFullName(customerName)) {
+      setCheckoutError('Enter a valid full name using letters, spaces, apostrophes, periods, or hyphens.');
+      return;
+    }
+    if (!isValidTelegramUsername(customerTelegram)) {
+      setCheckoutError('Enter a valid Telegram username with 5-32 letters, numbers, or underscores.');
+      return;
+    }
+    if (!isValidIndianWhatsappNumber(customerWhatsapp)) {
+      setCheckoutError('Enter a valid Indian WhatsApp number: 10 digits starting with 6-9, optionally with +91.');
       return;
     }
 
@@ -60,12 +75,17 @@ export const UPIPaymentModal: React.FC = () => {
 
   const handleSubmitVerification = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!checkoutService || !currentUser || !utrNumber.trim() || uploading) return;
+    if (!checkoutService || !utrNumber.trim() || uploading) return;
 
     setUploading(true);
     setCheckoutError(null);
     try {
-      const order = await placeOrder(checkoutService, selectedVariant?.id, contactMethod, utrNumber);
+      const order = await placeOrder(checkoutService, selectedVariant?.id, {
+        customerName,
+        customerTelegram,
+        customerWhatsapp,
+        contactMethod,
+      }, utrNumber);
       setActiveOrder(order);
       setStep('success');
     } catch (error) {
@@ -76,19 +96,32 @@ export const UPIPaymentModal: React.FC = () => {
   };
 
   return (
-    <div className="fixed inset-0 z-50 bg-black/70 backdrop-blur-md flex items-end sm:items-center justify-center p-0 sm:p-4 transition-all">
-      <div className="w-full max-w-lg ws-panel rounded-t-[22px] sm:rounded-[22px] p-6 animate-in slide-in-from-bottom-4 duration-200 overflow-y-auto max-h-[90vh]">
+    <div className="fixed inset-0 z-50 bg-[var(--color-shell)]/70 flex items-end sm:items-center justify-center p-0 sm:p-4">
+      <div className="w-full max-w-lg bg-[var(--color-surface)] border-t border-[var(--color-card-border)] sm:border rounded-t-[22px] sm:rounded-[22px] px-5 pt-3 pb-6 sm:p-6 overflow-y-auto max-h-[92vh] sm:max-h-[90vh]">
+        {/* Bottom-sheet grabber */}
+        <div className="sm:hidden mx-auto mb-4 h-1 w-10 rounded-full bg-[var(--color-grabber)]" />
+
+        {/* Step Progress */}
+        <div className="flex gap-1.5 mb-5" aria-hidden="true">
+          {[1, 2, 3].map(segment => (
+            <span
+              key={segment}
+              className={`h-1 flex-1 rounded-full ${segment <= stepNumber ? 'bg-[var(--color-brand-violet)]' : 'bg-[var(--color-track)]'}`}
+            />
+          ))}
+        </div>
+
         {/* Header */}
-        <div className="flex items-center justify-between pb-4 border-b border-[var(--color-card-border)] mb-4">
-          <div className="flex items-center gap-2.5">
+        <div className="flex items-center justify-between gap-3 pb-4 border-b border-[var(--color-card-border)] mb-5">
+          <div className="flex items-center gap-3 min-w-0">
             <div 
-              className="w-10 h-10 rounded-[14px] text-white flex items-center justify-center font-semibold text-lg"
+              className="w-11 h-11 shrink-0 rounded-[12px] text-white flex items-center justify-center font-semibold text-lg"
               style={{ backgroundColor: checkoutService.brandColor }}
             >
               {checkoutService.title.charAt(0)}
             </div>
-            <div>
-              <h3 className="font-heading font-semibold text-base text-[var(--color-text-primary)]">
+            <div className="min-w-0">
+              <h3 className="font-heading font-semibold text-base text-[var(--color-text-primary)] truncate">
                 {checkoutService.title}
               </h3>
               <p className="text-xs text-[var(--color-text-muted)]">
@@ -98,7 +131,8 @@ export const UPIPaymentModal: React.FC = () => {
           </div>
           <button
             onClick={closeCheckout}
-            className="w-8 h-8 rounded-full ws-chip flex items-center justify-center shrink-0 aspect-square hover:text-[var(--color-text-primary)]"
+            aria-label="Close checkout"
+            className="w-11 h-11 rounded-[14px] ws-secondary-button flex items-center justify-center shrink-0"
           >
             <X className="w-4 h-4" />
           </button>
@@ -107,31 +141,36 @@ export const UPIPaymentModal: React.FC = () => {
         {/* STEP 1: Customer Details */}
         {step === 'info' && (
           <form onSubmit={handleProceedToPayment} className="space-y-4">
-            {/* Price Summary Card */}
-            <div className="p-4 ws-panel-muted flex items-center justify-between">
+            <div className="flex items-start justify-between gap-3">
+              <h2 className="font-heading font-bold text-2xl text-[var(--color-text-primary)]">
+                Your details
+              </h2>
+              <span className="text-xs text-[var(--color-text-muted)] pt-1.5">Step 1 of 3</span>
+            </div>
+
+            {/* Price Summary */}
+            <div className="p-4 ws-panel-muted flex items-center justify-between gap-3">
               <div>
-                <span className="text-xs text-[var(--color-text-muted)] font-medium">Total Payable Amount</span>
-                <div className="flex items-baseline gap-2">
-                  <span className="font-heading font-bold text-2xl text-[var(--color-brand-violet)]">
-                    ₹{priceToPay}
+                <span className="block text-xs text-[var(--color-text-muted)] mb-1">Total payable</span>
+                <span className="font-heading font-bold text-[22px] text-[var(--color-brand-violet)]">
+                  ₹{priceToPay}
+                </span>
+                {isReseller && (
+                  <span className="ml-2 text-xs text-[var(--color-text-muted)] line-through">
+                    ₹{checkoutService.regularPrice}
                   </span>
-                  {isReseller && (
-                    <span className="text-xs text-[var(--color-text-muted)] line-through">
-                      ₹{checkoutService.regularPrice}
-                    </span>
-                  )}
-                </div>
+                )}
               </div>
               {isReseller && (
-                <span className="px-3 py-1 rounded-full bg-[var(--color-reseller-bg)] text-[var(--color-reseller-indigo)] text-xs font-semibold border border-[var(--color-card-border)] flex items-center gap-1">
-                  <Sparkles className="w-3 h-3" /> Reseller Rate
+                <span className="px-2.5 py-1 rounded-full bg-[var(--color-reseller-bg)] text-[var(--color-reseller-indigo)] text-[11px] font-semibold flex items-center gap-1 shrink-0">
+                  <Sparkles className="w-3 h-3" /> Reseller rate
                 </span>
               )}
             </div>
 
-            {checkoutService.variantMode === 'multiple' && (
+            {(checkoutService.variants || []).length > 1 && (
               <div>
-                <label className="block text-xs font-semibold text-[var(--color-text-secondary)] mb-1.5">Choose a variant</label>
+                <label className="block text-xs text-[var(--color-text-muted)] mb-1.5">Choose a variant</label>
                 <StyledDropdown
                   value={selectedVariant?.id || ''}
                   onChange={setSelectedVariantId}
@@ -140,14 +179,73 @@ export const UPIPaymentModal: React.FC = () => {
                     value: variant.id,
                     label: <span>{variant.name} · ₹{isReseller ? variant.resellerPrice : variant.ourPrice ?? variant.regularPrice} · {variant.validityValue} {variant.validityUnit}</span>,
                   }))}
-                  buttonClassName="px-4 py-3 rounded-full"
+                  buttonClassName="h-12 px-3.5 rounded-[14px]"
                 />
+                {selectedVariant?.deliveryTime && (
+                  <p className="mt-1.5 text-[11px] text-[var(--color-text-muted)]">Estimated delivery: {selectedVariant.deliveryTime}</p>
+                )}
               </div>
             )}
 
+            {(checkoutService.variants || []).length === 1 && selectedVariant && !selectedVariant.description && (
+              <p className="text-[11px] text-[var(--color-text-muted)]">
+                {selectedVariant.name} · {selectedVariant.validityValue} {selectedVariant.validityUnit}
+                {selectedVariant.deliveryTime ? ` · Delivery: ${selectedVariant.deliveryTime}` : ''}
+              </p>
+            )}
+
+            {selectedVariant?.description && (
+              <HighlightPoints text={selectedVariant.description} />
+            )}
+
             <div className="space-y-3">
+              <div>
+                <label htmlFor="checkout-name" className="block text-xs text-[var(--color-text-muted)] mb-1.5">
+                  Full name <span className="text-[var(--color-danger)]">*</span>
+                </label>
+                <input
+                  id="checkout-name"
+                  type="text"
+                  value={customerName}
+                  onChange={e => setCustomerName(sanitizeFullNameInput(e.target.value))}
+                  maxLength={120}
+                  className="w-full h-12 px-3.5 rounded-[14px] text-sm ws-input"
+                  placeholder="e.g. Rahul Sharma"
+                />
+              </div>
+              <div>
+                <label htmlFor="checkout-telegram" className="block text-xs text-[var(--color-text-muted)] mb-1.5">
+                  Telegram username <span className="text-[var(--color-danger)]">*</span>
+                </label>
+                <input
+                  id="checkout-telegram"
+                  type="text"
+                  value={customerTelegram}
+                  onChange={e => setCustomerTelegram(sanitizeTelegramInput(e.target.value))}
+                  maxLength={33}
+                  className="w-full h-12 px-3.5 rounded-[14px] text-sm ws-input"
+                  placeholder="@username"
+                  title="Use 5-32 letters, numbers, or underscores, optionally prefixed with @."
+                />
+              </div>
+              <div>
+                <label htmlFor="checkout-whatsapp" className="block text-xs text-[var(--color-text-muted)] mb-1.5">
+                  WhatsApp number <span className="text-[var(--color-danger)]">*</span>
+                </label>
+                <input
+                  id="checkout-whatsapp"
+                  type="text"
+                  inputMode="tel"
+                  value={customerWhatsapp}
+                  onChange={e => setCustomerWhatsapp(sanitizeIndianWhatsappInput(e.target.value))}
+                  maxLength={16}
+                  className="w-full h-12 px-3.5 rounded-[14px] text-sm ws-input"
+                  placeholder="+91 9876543210"
+                  title="Use an Indian mobile number starting with 6-9, with an optional +91 prefix."
+                />
+              </div>
               <div className="relative z-20">
-                <span className="block text-xs font-semibold text-[var(--color-text-secondary)] mb-1.5">Receive Order Via</span>
+                <span className="block text-xs text-[var(--color-text-muted)] mb-1.5">Receive order via</span>
                 <StyledDropdown
                   value={contactMethod}
                   onChange={value => {
@@ -159,38 +257,25 @@ export const UPIPaymentModal: React.FC = () => {
                     { value: 'telegram', label: 'Telegram' },
                     { value: 'whatsapp', label: 'WhatsApp' },
                   ]}
-                  buttonClassName="px-4 py-3 rounded-full"
+                  buttonClassName="h-12 px-3.5 rounded-[14px]"
                 />
-              </div>
-              <div>
-                <label className="block text-xs font-semibold text-[var(--color-text-secondary)] mb-1.5">
-                  {contactMethod === 'telegram' ? 'Telegram Username (For updates & support)' : 'WhatsApp Number (For updates & support)'}
-                </label>
-                <input
-                  type="text"
-                  value={contactMethod === 'telegram' ? (currentUser?.telegram ?? '') : (currentUser?.whatsapp ?? '')}
-                  readOnly
-                  placeholder={contactMethod === 'telegram' ? '@username' : '+91 9876543210'}
-                  className="w-full px-4 py-3 rounded-full text-sm ws-input read-only:opacity-75"
-                />
-                {contactMethod === 'whatsapp' && !currentUser?.whatsapp && <p className="text-[11px] text-[var(--color-danger)] mt-1">No WhatsApp contact added to your profile. Add WhatsApp in Profile settings before ordering.</p>}
-                <p className="text-[11px] text-[var(--color-text-muted)] mt-1">
-                  Make sure this is accurate so we can resolve tickets or message credentials if needed.
+                <p className="text-[11px] text-[var(--color-text-muted)] mt-1.5">
+                  We use both contacts for delivery and support; this picks the channel we message first.
                 </p>
               </div>
             </div>
 
             {checkoutError && (
-              <div className="p-3 rounded-[14px] bg-red-500/10 border border-red-500/20 text-xs text-[var(--color-danger)]">
+              <div className="p-3 rounded-[12px] bg-[var(--color-danger)]/10 border border-[var(--color-danger)]/20 text-xs text-[var(--color-danger)]">
                 {checkoutError}
               </div>
             )}
 
             <button
               type="submit"
-              className="w-full py-3.5 rounded-full ws-primary-button font-semibold text-sm hover:opacity-90 flex items-center justify-center gap-2 transition-all"
+              className="w-full h-[52px] rounded-[16px] ws-primary-button text-sm flex items-center justify-center gap-2 transition-opacity hover:opacity-90"
             >
-              <span>Generate UPI QR Code</span>
+              <span>Continue to payment</span>
               <ArrowRight className="w-4 h-4" />
             </button>
           </form>
@@ -198,79 +283,80 @@ export const UPIPaymentModal: React.FC = () => {
 
         {/* STEP 2: Semi-Automated UPI Payment QR & UTR Entry */}
         {step === 'payment' && (
-          <form onSubmit={handleSubmitVerification} className="space-y-4 text-center">
-            {/* Dynamic UPI QR Container */}
-            <div className="p-4 rounded-[24px] bg-white text-slate-900 shadow-lg inline-block border-4 border-slate-100 mx-auto">
-              <Image 
-                src={upiQrUrl} 
-                alt="UPI Payment QR Code" 
-                width={192}
-                height={192}
-                unoptimized
-                className="w-48 h-48 mx-auto object-contain rounded-xl" 
-              />
-              <div className="mt-2 pt-2 border-t border-slate-200">
-                <span className="text-[11px] font-semibold text-slate-500 uppercase block">
-                  Scan & Pay Exact Amount
-                </span>
-                <span className="font-heading font-bold text-2xl text-slate-900">
-                  ₹{priceToPay}
-                </span>
+          <form onSubmit={handleSubmitVerification} className="space-y-4">
+            <div className="flex items-start justify-between gap-3">
+              <h2 className="font-heading font-bold text-2xl text-[var(--color-text-primary)]">
+                Pay ₹{priceToPay} via UPI
+              </h2>
+              <span className="text-xs text-[var(--color-text-muted)] pt-1.5 shrink-0">Step 2 of 3</span>
+            </div>
+
+            {/* UPI QR + instructions */}
+            <div className="flex items-start gap-4">
+              <div className="w-[132px] h-[132px] sm:w-40 sm:h-40 shrink-0 rounded-[14px] bg-[#f2f0eb] p-2">
+                <Image
+                  src={upiQrUrl}
+                  alt="UPI Payment QR Code"
+                  width={192}
+                  height={192}
+                  unoptimized
+                  className="w-full h-full object-contain rounded-[8px]"
+                />
               </div>
+              <p className="text-[13px] leading-[1.5] text-[var(--color-text-secondary)]">
+                Scan with any UPI app, pay the exact amount, then paste the 12-digit UTR below.
+              </p>
             </div>
 
             {/* UPI ID One-Tap Copy */}
             <div className="flex flex-col gap-2">
-              <div className="p-3 rounded-full ws-panel-muted flex items-center justify-between max-w-sm mx-auto w-full">
-                <div className="text-left pl-2">
-                  <span className="text-[10px] text-[var(--color-text-muted)] uppercase block">
-                    Primary UPI VPA
+              <div className="p-3 ws-panel-muted flex items-center justify-between gap-3">
+                <div className="min-w-0 pl-1">
+                  <span className="block text-[11px] text-[var(--color-text-muted)]">
+                    Primary UPI ID
                   </span>
-                  <span className="font-mono-code font-bold text-xs text-[var(--color-text-primary)]">
+                  <span className="font-mono-code font-semibold text-[13px] text-[var(--color-text-primary)] truncate block">
                     {upiId}
                   </span>
                 </div>
                 <button
                   type="button"
                   onClick={handleCopyUPI}
-                  className="px-3 py-1.5 rounded-full ws-primary-button text-xs font-semibold flex items-center gap-1 hover:opacity-90 transition-opacity"
+                  className="h-11 px-3.5 rounded-[12px] ws-secondary-button text-xs font-semibold flex items-center gap-1.5 shrink-0 transition-colors"
                 >
-                  {copiedUPI ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
+                  {copiedUPI ? <Check className="w-3.5 h-3.5 text-[var(--color-success)]" /> : <Copy className="w-3.5 h-3.5" />}
                   <span>{copiedUPI ? 'Copied' : 'Copy UPI'}</span>
                 </button>
               </div>
-              
-              <div className="text-center">
-                <span className="text-[10px] text-[var(--color-text-muted)] block">
-                  Backup UPI ID: <span className="font-mono-code font-medium">{backupUpiId}</span>
-                </span>
-              </div>
+
+              <span className="text-[11px] text-[var(--color-text-muted)]">
+                Backup UPI ID: <span className="font-mono-code">{backupUpiId}</span>
+              </span>
             </div>
 
             {/* UTR Input */}
-            <div className="text-left space-y-3 pt-2">
-              <div>
-                <label className="block text-xs font-semibold text-[var(--color-text-secondary)] mb-1">
-                  12-Digit UPI UTR / Ref Number <span className="text-rose-500">*</span>
-                </label>
-                <input
-                  type="text"
-                  required
-                  pattern="[0-9]{12}"
-                  maxLength={12}
-                  value={utrNumber}
-                  onChange={e => setUtrNumber(e.target.value.replace(/\D/g, ''))}
-                  placeholder="e.g. 428819039122"
-                  className="w-full px-4 py-3 rounded-full text-sm font-mono-code ws-input"
-                />
-                <p className="text-[10px] text-[var(--color-text-muted)] mt-1.5">
-                  You can find the 12-digit UTR/Reference number in the payment details of your UPI app (GPay, PhonePe, Paytm) after successful payment.
-                </p>
-              </div>
+            <div>
+              <label htmlFor="checkout-utr" className="block text-xs text-[var(--color-text-muted)] mb-1.5">
+                UTR number <span className="text-[var(--color-danger)]">*</span>
+              </label>
+              <input
+                id="checkout-utr"
+                type="text"
+                required
+                pattern="[0-9]{12}"
+                maxLength={12}
+                value={utrNumber}
+                onChange={e => setUtrNumber(e.target.value.replace(/\D/g, ''))}
+                placeholder="e.g. 4091 2233 8841"
+                className="w-full h-12 px-3.5 rounded-[14px] text-sm font-mono-code ws-input"
+              />
+              <p className="text-[11px] text-[var(--color-text-muted)] mt-1.5">
+                You can find the 12-digit UTR/Reference number in the payment details of your UPI app (GPay, PhonePe, Paytm) after successful payment.
+              </p>
             </div>
 
             {checkoutError && (
-              <div className="p-3 rounded-[14px] bg-red-500/10 border border-red-500/20 text-xs text-[var(--color-danger)]">
+              <div className="p-3 rounded-[12px] bg-[var(--color-danger)]/10 border border-[var(--color-danger)]/20 text-xs text-[var(--color-danger)]">
                 {checkoutError}
               </div>
             )}
@@ -280,64 +366,55 @@ export const UPIPaymentModal: React.FC = () => {
               loading={uploading}
               loadingLabel="Verifying transaction..."
               disabled={utrNumber.length < 12}
-              className="w-full py-3.5 rounded-full ws-primary-button font-semibold text-sm hover:opacity-90 disabled:opacity-50 flex items-center justify-center gap-2 transition-all"
+              className="w-full h-[52px] rounded-[16px] ws-primary-button text-sm disabled:opacity-50 flex items-center justify-center gap-2 transition-opacity hover:opacity-90"
             >
               <ShieldCheck className="w-4 h-4" />
-              <span>Submit Payment Verification</span>
+              <span>Submit for verification</span>
             </LoadingButton>
           </form>
         )}
 
         {/* STEP 3: Submission Confirmation */}
         {step === 'success' && activeOrder && (
-          <div className="text-center py-4 space-y-4">
-            <div className="w-16 h-16 rounded-full bg-emerald-500/10 text-emerald-500 flex items-center justify-center mx-auto shadow-inner">
+          <div className="space-y-4">
+            <div className="flex items-start justify-between gap-3">
+              <h2 className="font-heading font-bold text-2xl text-[var(--color-text-primary)]">
+                Order submitted
+              </h2>
+              <span className="text-xs text-[var(--color-text-muted)] pt-1.5 shrink-0">Step 3 of 3</span>
+            </div>
+
+            <div className="w-16 h-16 rounded-full bg-[var(--color-success)]/10 text-[var(--color-success)] flex items-center justify-center mx-auto">
               <Check className="w-8 h-8 stroke-[3]" />
             </div>
 
-            <div>
-              <h3 className="font-heading font-bold text-xl text-[var(--color-text-primary)] mb-1">
-                Order Submitted
-              </h3>
-              <p className="text-xs text-[var(--color-text-secondary)] max-w-xs mx-auto">
-                Your order ID <span className="font-mono-code font-bold text-[var(--color-brand-violet)]">{activeOrder.id}</span> is recorded. Payment verification in progress.
-              </p>
-            </div>
+            <p className="text-[13px] text-[var(--color-text-secondary)] text-center max-w-sm mx-auto">
+              Your order ID <span className="font-mono-code font-semibold text-[var(--color-brand-violet)]">{activeOrder.id}</span> is recorded. Payment verification in progress.
+            </p>
 
-            <div className="p-4 ws-panel-muted text-left text-xs space-y-2">
-              <div className="flex justify-between">
-                <span className="text-[var(--color-text-muted)]">Order Secret Key:</span>
-                <span className="font-mono-code font-bold text-[var(--color-text-primary)]">{activeOrder.secretKey}</span>
+            <div className="p-4 ws-panel-muted text-left text-xs space-y-2.5">
+              <div className="flex justify-between gap-3">
+                <span className="text-[var(--color-text-muted)]">Order secret key</span>
+                <span className="font-mono-code font-semibold text-[var(--color-text-primary)]">{activeOrder.secretKey}</span>
               </div>
-              <div className="flex justify-between">
-                <span className="text-[var(--color-text-muted)]">UTR Reference:</span>
+              <div className="flex justify-between gap-3">
+                <span className="text-[var(--color-text-muted)]">UTR reference</span>
                 <span className="font-mono-code text-[var(--color-text-primary)]">{activeOrder.utrNumber}</span>
               </div>
-              <div className="flex justify-between">
-                <span className="text-[var(--color-text-muted)]">Account delivery:</span>
-                <span className="capitalize font-semibold text-[var(--color-brand-violet)]">
-                  Account details after verification
+              <div className="flex justify-between gap-3">
+                <span className="text-[var(--color-text-muted)]">Account delivery</span>
+                <span className="font-semibold text-[var(--color-brand-violet)]">
+                  After verification
                 </span>
               </div>
             </div>
 
-            <div className="flex gap-2">
-              <button
-                onClick={() => {
-                  closeCheckout();
-                  openOrderDetails(activeOrder);
-                }}
-                className="flex-1 py-3 rounded-full ws-primary-button font-semibold text-xs"
-              >
-                Track Order Status
-              </button>
-              <button
-                onClick={closeCheckout}
-                className="px-4 py-3 rounded-full ws-chip text-[var(--color-text-primary)] font-semibold text-xs"
-              >
-                Done
-              </button>
-            </div>
+            <button
+              onClick={closeCheckout}
+              className="w-full h-12 rounded-[14px] ws-primary-button text-[13px] font-semibold transition-opacity hover:opacity-90"
+            >
+              Done
+            </button>
           </div>
         )}
       </div>

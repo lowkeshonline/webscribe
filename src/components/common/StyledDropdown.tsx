@@ -89,7 +89,7 @@ export const StyledDropdown: React.FC<StyledDropdownProps> = ({
           if (!open) setSearch('');
           setOpen(current => !current);
         }}
-        className={`${fullButton ? 'w-full' : ''} px-3 py-2.5 rounded-xl text-sm ws-input flex items-center ${triggerContent ? 'justify-center' : 'justify-between'} gap-3 text-left disabled:opacity-50 ${buttonClassName}`}
+        className={`${fullButton ? 'w-full' : ''} h-11 ${triggerContent ? 'px-0' : 'px-3.5'} rounded-[14px] text-sm ws-input flex items-center ${triggerContent ? 'justify-center' : 'justify-between'} gap-3 text-left disabled:opacity-50 ${buttonClassName}`}
       >
         <span className={`min-w-0 truncate ${triggerContent ? '' : selectedOption ? 'text-[var(--color-text-primary)]' : 'text-[var(--color-text-muted)]'}`}>
           {loading ? <span className="inline-flex items-center gap-2"><LoaderCircle className="w-3.5 h-3.5 animate-spin" aria-hidden="true" /><span className={triggerContent ? 'hidden sm:inline' : ''}>Loading...</span></span> : triggerContent ?? selectedOption?.selectedLabel ?? selectedOption?.label ?? placeholder}
@@ -98,7 +98,7 @@ export const StyledDropdown: React.FC<StyledDropdownProps> = ({
       </button>
 
       {open && (
-        <div role="listbox" className={`absolute left-0 right-0 z-50 max-h-64 overflow-y-auto p-1 ws-panel shadow-lg ${menuPlacement === 'top' ? 'bottom-full mb-2' : 'top-full mt-2'} ${menuClassName}`}>
+        <div role="listbox" className={`absolute left-0 right-0 z-50 max-h-64 overflow-y-auto p-1.5 rounded-[14px] ws-panel shadow-[var(--shadow-card)] ${menuPlacement === 'top' ? 'bottom-full mb-2' : 'top-full mt-2'} ${menuClassName}`}>
           {searchable && (
             <input
               ref={searchRef}
@@ -106,7 +106,7 @@ export const StyledDropdown: React.FC<StyledDropdownProps> = ({
               onChange={event => setSearch(event.target.value)}
               onClick={event => event.stopPropagation()}
               placeholder={searchPlaceholder}
-              className="w-full px-3 py-2 mb-1 rounded-lg text-xs ws-input"
+              className="w-full h-11 px-3 mb-1 rounded-[10px] text-xs ws-input"
               aria-label={searchPlaceholder}
             />
           )}
@@ -122,7 +122,7 @@ export const StyledDropdown: React.FC<StyledDropdownProps> = ({
                 onChange(option.value);
                 setOpen(false);
               }}
-              className={`w-full px-3 py-2.5 rounded-lg text-left text-xs transition-colors disabled:opacity-50 ${option.value === value ? 'bg-[var(--color-brand-violet-wash)]' : 'hover:bg-[var(--color-surface-hover)]'}`}
+              className={`w-full min-h-11 px-3 py-2 rounded-[10px] text-left text-xs transition-colors disabled:opacity-50 ${option.value === value ? 'bg-[var(--color-brand-violet-wash)]' : 'hover:bg-[var(--color-surface-hover)]'}`}
             >
               <span className="flex items-center justify-between gap-3">
                 <span className="min-w-0 flex-1">{option.label}</span>

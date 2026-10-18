@@ -3,12 +3,10 @@ const indianWhatsappPattern = /^(?:[6-9]\d{9}|(?:\+91|91)[ -]?[6-9]\d{9})$/;
 const emailPattern = /^[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+(?:\.[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+)*@(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$/;
 const nameToken = String.raw`(?:[\p{L}\p{M}]+(?:['-][\p{L}\p{M}]+)*|(?:[\p{L}\p{M}]\.)+)`;
 const fullNamePattern = new RegExp(`^${nameToken}(?: ${nameToken})*$`, 'u');
-const passwordPattern = /.{8,72}/;
 
 export const TELEGRAM_USERNAME_PATTERN = telegramPattern.source;
 export const INDIAN_WHATSAPP_PATTERN = indianWhatsappPattern.source;
 export const EMAIL_PATTERN = emailPattern.source;
-export const PASSWORD_PATTERN = passwordPattern.source;
 
 export const isValidTelegramUsername = (value: string) => telegramPattern.test(value.trim());
 
@@ -30,8 +28,6 @@ export const isValidFullName = (value: string) => {
   const name = value.trim().replace(/\s+/g, ' ');
   return name.length >= 2 && name.length <= 120 && fullNamePattern.test(name);
 };
-
-export const isValidPasswordLength = (value: string) => value.length >= 8 && value.length <= 72;
 
 export const sanitizeTelegramInput = (value: string) => value
   .replace(/[^A-Za-z0-9_@]/g, '')

@@ -2,44 +2,45 @@
 
 import React from 'react';
 import { useApp } from '@/context/AppContext';
-import { Sparkles } from 'lucide-react';
+import { ArrowRight, Star } from 'lucide-react';
 
 export const HeroConstellation: React.FC = () => {
-  const { currentRole } = useApp();
+  const { currentRole, setActiveTab } = useApp();
 
   return (
-    <section className="py-8 px-4 max-w-6xl mx-auto">
-      {/* Role Banner / VIP Reseller Alert */}
+    <section className="max-w-6xl mx-auto w-full px-4 pt-10 sm:pt-16 pb-12">
+      {/* Role Banner */}
       {currentRole === 'reseller' && (
-        <div className="mb-6 p-4 ws-panel flex items-center justify-between flex-wrap gap-3">
-          <div className="flex items-center gap-3">
-            <div className="w-10 h-10 rounded-[14px] bg-[var(--color-reseller-bg)] text-[var(--color-reseller-indigo)] flex items-center justify-center">
-              <Sparkles className="w-5 h-5" />
-            </div>
-            <div>
-              <h4 className="font-heading font-semibold text-sm text-[var(--color-text-primary)]">
-                VIP Reseller Margin Mode Active
-              </h4>
-              <p className="text-xs text-[var(--color-text-secondary)]">
-                You are viewing wholesale volume prices. Up to 40% discount applied automatically on all slots.
-              </p>
-            </div>
-          </div>
-          <span className="px-3 py-1.5 rounded-full bg-[var(--color-reseller-bg)] border border-[var(--color-card-border)] text-[var(--color-reseller-indigo)] text-xs font-semibold">
-            Admin Approved
-          </span>
+        <div className="mb-6 rounded-[14px] border border-[var(--color-banner-border)] bg-[var(--color-banner)] px-3.5 py-2.5 text-xs text-[var(--color-brand-violet)]">
+          Reseller pricing active · wholesale margin shown on every card
         </div>
       )}
 
       {/* Hero introduction */}
-      <div className="text-center max-w-2xl mx-auto mb-6">
-        <h1 className="font-heading font-bold text-3xl sm:text-5xl text-[var(--color-text-primary)] mb-3 leading-tight">
-          Premium OTT Services <br />
-          <span className="text-[var(--color-brand-violet)]">at budget prices</span>
-        </h1>
-        <p className="text-sm sm:text-base text-[var(--color-text-secondary)] mb-6">
-          Netflix 4K, ChatGPT Plus, Prime Video & Spotify, and many more.
-        </p>
+      <h1 className="font-heading font-bold text-[40px] sm:text-[64px] leading-[1.02] text-[var(--color-text-primary)] max-w-3xl">
+        Premium OTT services at budget prices
+      </h1>
+      <p className="mt-4 max-w-xl text-[15px] sm:text-[17px] leading-[1.55] text-[var(--color-text-muted)]">
+        Pick a service, pay with UPI, and get your credentials on Telegram or WhatsApp. No account needed to buy.
+      </p>
+      <div className="mt-6 flex flex-wrap items-center gap-3">
+        <button
+          type="button"
+          onClick={() => setActiveTab('catalog')}
+          className="ws-primary-button h-[52px] px-7 rounded-[16px] text-[15px] inline-flex items-center gap-2 active:scale-95 transition-transform"
+        >
+          Browse the catalog
+          <ArrowRight className="w-4 h-4" />
+        </button>
+        <a
+          href="https://t.me/Webscibe_Reviews"
+          target="_blank"
+          rel="noopener noreferrer"
+          className="ws-secondary-button h-[52px] px-7 rounded-[16px] text-[15px] font-semibold inline-flex items-center gap-2 active:scale-95 transition-transform"
+        >
+          <Star className="w-4 h-4 text-[var(--color-brand-violet)] fill-current" />
+          Read real customer reviews
+        </a>
       </div>
     </section>
   );

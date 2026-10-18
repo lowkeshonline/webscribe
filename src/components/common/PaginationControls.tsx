@@ -34,7 +34,7 @@ export const PaginationControls: React.FC<PaginationControlsProps> = ({
         loading={disabled}
         aria-label={`Previous ${label.toLowerCase()} page`}
         title="Previous page"
-        className="w-9 h-9 rounded-lg ws-chip inline-flex items-center justify-center disabled:opacity-40"
+        className="w-10 h-10 rounded-[12px] ws-chip inline-flex items-center justify-center disabled:opacity-40"
       >
         <ChevronLeft className="w-4 h-4" />
       </LoadingButton>
@@ -46,7 +46,7 @@ export const PaginationControls: React.FC<PaginationControlsProps> = ({
           disabled={disabled || pageNumber === page}
           loading={disabled}
           aria-current={pageNumber === page ? 'page' : undefined}
-          className={`min-w-9 h-9 px-2 rounded-lg text-xs font-semibold inline-flex items-center justify-center ${pageNumber === page ? 'ws-primary-button' : 'ws-chip'} disabled:opacity-70`}
+          className={`min-w-10 h-10 px-2 rounded-[12px] text-xs font-semibold inline-flex items-center justify-center ${pageNumber === page ? 'ws-primary-button' : 'ws-chip'} disabled:opacity-70`}
         >
           {pageNumber}
         </LoadingButton>
@@ -58,7 +58,7 @@ export const PaginationControls: React.FC<PaginationControlsProps> = ({
         loading={disabled}
         aria-label={`Next ${label.toLowerCase()} page`}
         title="Next page"
-        className="w-9 h-9 rounded-lg ws-chip inline-flex items-center justify-center disabled:opacity-40"
+        className="w-10 h-10 rounded-[12px] ws-chip inline-flex items-center justify-center disabled:opacity-40"
       >
         <ChevronRight className="w-4 h-4" />
       </LoadingButton>

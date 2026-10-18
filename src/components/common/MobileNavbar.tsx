@@ -2,61 +2,39 @@
 
 import React from 'react';
 import { useApp, MobileTab } from '@/context/AppContext';
-import { Compass, Grid, ShoppingBag, HelpCircle, ShieldAlert } from 'lucide-react';
+import { House, LayoutGrid, LifeBuoy } from 'lucide-react';
+import type { LucideIcon } from 'lucide-react';
 
 export const MobileNavbar: React.FC = () => {
-  const { activeTab, setActiveTab, orders, tickets, currentRole, currentUser, isAdmin, authLoading } = useApp();
-
-  // Customer data is already profile-scoped by the server actions.
-  const visibleOrders = isAdmin || currentUser ? orders : [];
-  const visibleTickets = isAdmin || currentUser ? tickets : [];
-
-  const activeOrdersCount = visibleOrders.filter(
-    o => o.paymentStatus === 'verification_pending' || o.deliveryStatus === 'action_required'
-  ).length;
-
-  const openTicketsCount = visibleTickets.filter(t => t.status === 'open').length;
+  const { activeTab, setActiveTab, isAdmin, authLoading } = useApp();
 
   if (authLoading || isAdmin) return null;
 
-  const navItems: { id: MobileTab; label: string; icon: React.ElementType; badge?: number; adminOnly?: boolean }[] = [
-    { id: 'home', label: 'Explore', icon: Compass },
-    { id: 'catalog', label: 'Catalog', icon: Grid },
-    { id: 'orders', label: 'My Orders', icon: ShoppingBag, badge: activeOrdersCount },
-    { id: 'tickets', label: 'Support', icon: HelpCircle, badge: openTicketsCount },
-    { id: 'admin', label: 'Admin Hub', icon: ShieldAlert, badge: activeOrdersCount, adminOnly: true },
+  const navItems: { id: MobileTab; label: string; icon: LucideIcon }[] = [
+    { id: 'home', label: 'Home', icon: House },
+    { id: 'catalog', label: 'Catalog', icon: LayoutGrid },
+    { id: 'support', label: 'Support', icon: LifeBuoy },
   ];
 
   return (
-    <nav className="fixed bottom-0 left-0 right-0 z-40 bg-[var(--color-surface-solid)]/95 border-t border-[var(--color-card-border)] pb-safe">
-      <div className="max-w-md mx-auto px-4 py-2 flex items-center justify-around">
+    <nav className="fixed bottom-0 left-0 right-0 z-40 bg-[var(--color-nav)] border-t border-[var(--color-card-border)]">
+      <div className="max-w-md mx-auto px-3 pt-2 pb-safe flex items-stretch gap-2">
         {navItems.map(item => {
-          const Icon = item.icon;
           const isActive = activeTab === item.id;
-          
-          if (item.adminOnly && currentRole !== 'admin') {
-            return null;
-          }
 
           return (
             <button
               key={item.id}
+              type="button"
               onClick={() => setActiveTab(item.id)}
-              className={`relative flex flex-col items-center gap-1 px-3 py-1.5 rounded-[14px] transition-all ${
-                isActive 
-                  ? 'bg-[var(--color-brand-violet-wash)] text-[var(--color-brand-violet)] font-semibold' 
+              className={`flex-1 h-12 rounded-[14px] text-xs font-semibold transition-colors flex flex-col items-center justify-center gap-0.5 ${
+                isActive
+                  ? 'bg-[var(--color-surface-hover)] text-[var(--color-brand-violet)]'
                   : 'text-[var(--color-text-muted)] hover:text-[var(--color-text-primary)]'
               }`}
             >
-              <div className="relative">
-                <Icon className={`w-5 h-5 transition-transform ${isActive ? 'stroke-[2.5px]' : 'stroke-2'}`} />
-                {item.badge !== undefined && item.badge > 0 && (
-                  <span className="absolute -top-1.5 -right-2 px-1.5 py-0.5 rounded-full bg-[var(--color-brand-violet)] text-white dark:text-[#181715] text-[9px] font-semibold leading-none">
-                    {item.badge}
-                  </span>
-                )}
-              </div>
-              <span className="text-[10px]">{item.label}</span>
+              <item.icon className="w-[18px] h-[18px]" />
+              {item.label}
             </button>
           );
         })}

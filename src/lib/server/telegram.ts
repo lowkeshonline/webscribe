@@ -16,8 +16,7 @@ const escapeHtml = (value: unknown, maxLength = 500) => String(value ?? '')
   .replace(/>/g, '&gt;');
 
 const writeTelegramLog = async (entry: Record<string, unknown>) => {
-  const { error } = await getSupabaseAdmin().from('telegram_logs').insert(entry);
-  if (error) console.error('Unable to write Telegram log:', error);
+  await getSupabaseAdmin().from('telegram_logs').insert(entry);
 };
 
 export const sendTelegramMessage = async ({ orderId, ticketId, chatId, message }: TelegramMessageInput) => {

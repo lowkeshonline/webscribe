@@ -25,8 +25,8 @@ The application accesses Supabase only from authenticated server actions through
 2. Add every variable from `.env.example` to the Production environment.
 3. In Supabase Auth URL Configuration, set the Site URL to the production Vercel domain and enable email confirmation for public registration.
 4. Use a strong, unique `ADMIN_PASSWORD` only if you retain password login for the administrator. Generate `CREDENTIAL_ENCRYPTION_KEY` once with `openssl rand -base64 32`, store it securely, and keep the same value across deployments.
-5. Configure Google OAuth in Supabase Auth and add the application callback URL described in `supabase/README.md`.
-6. Deploy and verify customer registration, Google/admin login, payment submission, Telegram admin notification, account assignment, fulfillment, and ticket creation.
+5. Optional (customer login is disabled for now): configure Google OAuth in Supabase Auth and add the application callback URL described in `supabase/README.md`.
+6. Deploy and verify guest checkout (order form collects name, Telegram, and WhatsApp), admin login, payment submission, Telegram admin notification, account assignment, fulfillment, and ticket creation.
 
 Run the local production checks before pushing:
 

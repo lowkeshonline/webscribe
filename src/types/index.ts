@@ -27,6 +27,11 @@ export interface ServiceVariant {
   stockCount: number;
   validityValue: number;
   validityUnit: ServiceValidityUnit;
+  deliveryTime?: string;
+  /** Per-plan highlights, one point per line. */
+  description?: string;
+  dos?: string;
+  donts?: string;
 }
 
 export type StockStatus = 'in_stock' | 'low_stock' | 'out_of_stock';
@@ -48,6 +53,7 @@ export interface Service {
   stockStatus: StockStatus;
   validityValue: number;
   validityUnit: ServiceValidityUnit;
+  deliveryTime?: string;
   variantMode?: ServiceVariantMode;
   priceStartsAt?: number;
   variants?: ServiceVariant[];
@@ -154,6 +160,3 @@ export interface AdminOrderPage extends PaginatedResult<Order> {
   serviceTypes: string[];
   search: string;
 }
-
-export type CustomerOrderPage = PaginatedResult<Order>;
-export type CustomerTicketPage = PaginatedResult<Ticket>;

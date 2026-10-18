@@ -50,6 +50,7 @@ create table if not exists services (
 alter table services add column if not exists variants jsonb not null default '[]'::jsonb;
 alter table services add column if not exists dos text;
 alter table services add column if not exists donts text;
+alter table services add column if not exists delivery_time text;
 alter table services drop column if exists delivery_method;
 alter table services drop column if exists specs;
 alter table services drop column if exists usage_instructions;
@@ -94,7 +95,8 @@ create table if not exists orders (
   donts text,
   expires_at timestamptz,
   created_at timestamptz not null default now(),
-  updated_at timestamptz not null default now()
+  updated_at timestamptz not null default now(),
+  constraint orders_customer_whatsapp_required check (nullif(trim(customer_whatsapp), '') is not null)
 );
 
 create table if not exists account_credentials (
@@ -128,6 +130,9 @@ alter table orders drop column if exists usage_instructions;
 alter table profiles drop constraint if exists profiles_contact_required;
 alter table profiles add constraint profiles_contact_required
   check (nullif(trim(telegram), '') is not null or nullif(trim(whatsapp), '') is not null) not valid;
+alter table orders drop constraint if exists orders_customer_whatsapp_required;
+alter table orders add constraint orders_customer_whatsapp_required
+  check (nullif(trim(customer_whatsapp), '') is not null) not valid;
 alter table account_credentials drop constraint if exists account_credentials_expiry_required;
 alter table account_credentials add constraint account_credentials_expiry_required
   check (expires_at is not null) not valid;

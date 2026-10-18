@@ -2,29 +2,22 @@
 
 import { randomBytes } from 'node:crypto';
 import { revalidatePath } from 'next/cache';
-import { headers, cookies } from 'next/headers';
-import { AccountCredential, AdminOrderPage, AdminTicketPage, CustomerOrderPage, CustomerTicketPage, Service, UserProfile } from '@/types';
+import { AccountCredential, AdminOrderPage, AdminTicketPage, Service, UserProfile } from '@/types';
 import { getSupabaseAdmin, getSupabaseAuth } from '@/lib/server/supabaseAdmin';
 import { isAdminEmail, normalizeEmail } from '@/lib/server/authz';
 import { getAdminPassword } from '@/lib/server/env';
 import { decryptCredential, encryptCredential } from '@/lib/server/credentialCrypto';
 import { mapOrderRow, mapProfileRow, mapServiceRow, mapTicketRow } from '@/lib/server/mappers';
-import { isValidEmail, isValidFullName, isValidPasswordLength, isValidTelegramUsername, normalizeIndianWhatsappNumber } from '@/lib/validation';
+import { isValidEmail, isValidFullName, isValidTelegramUsername, normalizeIndianWhatsappNumber } from '@/lib/validation';
 import {
   getCurrentProfile,
   getCurrentSessionUser,
-  createOAuthCookieStorage,
   refreshCurrentSession,
   requireCurrentAdmin,
-  requireCurrentProfile,
   revokeCurrentSession,
   setAuthCookies,
 } from '@/lib/server/session';
-import {
-  buildPaymentNotification,
-  buildTicketNotification,
-  sendTelegramMessage,
-} from '@/lib/server/telegram';
+import { buildPaymentNotification, buildTicketNotification, sendTelegramMessage } from '@/lib/server/telegram';
 
 export type ActionResult<T = null> =
   | { ok: true; data: T }
@@ -43,7 +36,6 @@ const fail = <T = null,>(error: unknown): ActionResult<T> => {
     return { ok: false, error: error.message };
   }
 
-  console.error('Server action failed:', error);
   return { ok: false, error: 'The request could not be completed. Please try again.' };
 };
 
@@ -92,14 +84,6 @@ const normalizeFullName = (value: unknown) => {
   return fullName;
 };
 
-const validateUserPassword = (value: unknown, field = 'Password') => {
-  const password = asString(value, field);
-  if (!isValidPasswordLength(password)) {
-    throw actionError(`${field} must be between 8 and 72 characters.`);
-  }
-  return password;
-};
-
 const randomCode = (length: number) => {
   let code = '';
   while (code.length < length) {
@@ -112,31 +96,6 @@ const nextOrderId = () => `ORD-${randomCode(10)}`;
 const nextTicketId = () => `TCK-${randomCode(8)}`;
 const nextAccountId = () => `ACC-${randomCode(6)}`;
 const nextOrderSecret = () => `WS-${randomCode(24)}`;
-const getRequestOrigin = async () => {
-  const requestHeaders = await headers();
-  const requestOrigin = requestHeaders.get('origin');
-  const forwardedHost = requestHeaders.get('x-forwarded-host')?.split(',')[0].trim();
-  const host = forwardedHost || requestHeaders.get('host');
-  const forwardedProtocol = requestHeaders.get('x-forwarded-proto')?.split(',')[0].trim();
-  const protocol = forwardedProtocol || (process.env.NODE_ENV === 'development' ? 'http' : 'https');
-  if (!host) throw actionError('Unable to determine the application URL.');
-
-  // Server Actions can pass through a local proxy while the browser is using
-  // a LAN address (for example, an iPhone testing a local dev server). The
-  // browser Origin is the callback origin that Supabase must return to.
-  if (requestOrigin) {
-    try {
-      const origin = new URL(requestOrigin);
-      if ((origin.protocol === 'http:' || origin.protocol === 'https:') && origin.host === host) {
-        return origin.origin;
-      }
-    } catch {
-      // Fall through to the trusted request host below.
-    }
-  }
-
-  return `${protocol}://${host}`;
-};
 
 const updateProfileClaims = async (authUserId: string, profileId: string, role: UserProfile['role']) => {
   const { error } = await getSupabaseAdmin().auth.admin.updateUserById(authUserId, {
@@ -189,7 +148,6 @@ const mapTicketWithOrder = (row: Record<string, unknown>, order?: Record<string,
 
 const ADMIN_TICKET_PAGE_SIZE = 10;
 const ADMIN_ORDER_PAGE_SIZE = 10;
-const CUSTOMER_PAGE_SIZE = 10;
 
 const sanitizeTicketSearch = (value: unknown) => typeof value === 'string'
   ? value.trim().replace(/[\\%_,()]/g, '').slice(0, 100)
@@ -210,83 +168,8 @@ const applyOrderSearch = <T extends { or: (filters: string) => T; ilike: (col: s
   return query.or(`id.ilike.%${search}%,account_id.ilike.%${search}%,customer_telegram.ilike.%${search}%`);
 };
 
-export async function beginGoogleSignInAction(): Promise<ActionResult<{ url: string }>> {
-  try {
-    const cookieStore = await cookies();
-    const redirectTo = `${await getRequestOrigin()}/auth/callback`;
-    const { data, error } = await getSupabaseAuth({
-      flowType: 'pkce',
-      storage: createOAuthCookieStorage(cookieStore),
-    }).auth.signInWithOAuth({
-      provider: 'google',
-      options: {
-        redirectTo,
-        skipBrowserRedirect: true,
-        queryParams: { prompt: 'select_account' },
-      },
-    });
-
-    if (error || !data.url) throw actionError('Google sign-in is unavailable right now. Please try again.');
-    return { ok: true, data: { url: data.url } };
-  } catch (error) {
-    return fail(error);
-  }
-}
-
-// Supabase sends the OAuth code to the configured redirect URL. This action
-// also handles the Site URL fallback for projects whose redirect allow-list is
-// not yet complete, so the browser does not lose a valid PKCE sign-in.
-export async function completeGoogleOAuthAction(code: string): Promise<ActionResult> {
-  try {
-    const authCode = asString(code, 'OAuth code');
-    if (authCode.length > 2_000) throw actionError('Google sign-in could not be completed. Please try again.');
-
-    const cookieStore = await cookies();
-    const { data, error } = await getSupabaseAuth({
-      flowType: 'pkce',
-      storage: createOAuthCookieStorage(cookieStore),
-    }).auth.exchangeCodeForSession(authCode);
-
-    if (error || !data.session) throw actionError('Google sign-in could not be completed. Please try again.');
-    await setAuthCookies(data.session);
-    return { ok: true, data: null };
-  } catch (error) {
-    return fail(error);
-  }
-}
-
-// PKCE is the normal browser flow. This only supports an implicit callback
-// when a Supabase project is still configured to return tokens in the URL
-// fragment, so users do not silently land in an anonymous application state.
-export async function completeGoogleImplicitOAuthAction(input: {
-  accessToken: string;
-  refreshToken: string;
-}): Promise<ActionResult> {
-  try {
-    const accessToken = asString(input.accessToken, 'OAuth access token');
-    const refreshToken = asString(input.refreshToken, 'OAuth refresh token');
-    if (accessToken.length > 8_000 || refreshToken.length > 8_000) {
-      throw actionError('Google sign-in could not be completed. Please try again.');
-    }
-
-    const { data, error } = await getSupabaseAuth({ flowType: 'implicit' }).auth.setSession({
-      access_token: accessToken,
-      refresh_token: refreshToken,
-    });
-    if (error || !data.session) throw actionError('Google sign-in could not be completed. Please try again.');
-
-    await setAuthCookies(data.session);
-    return { ok: true, data: null };
-  } catch (error) {
-    console.error('Google implicit OAuth completion failed:', error);
-    return fail(error);
-  }
-}
-
 export async function getBootstrapDataAction(): Promise<ActionResult<{
   profile: UserProfile | null;
-  profileCompletionRequired: boolean;
-  profileDraft: { fullName: string; email: string } | null;
   services: Service[];
   orders: ReturnType<typeof mapOrderRow>[];
   tickets: ReturnType<typeof mapTicketRow>[];
@@ -298,29 +181,9 @@ export async function getBootstrapDataAction(): Promise<ActionResult<{
   try {
     const supabase = getSupabaseAdmin();
     const sessionUser = await getCurrentSessionUser();
-    let profile = await getCurrentProfile() || (!sessionUser ? await refreshCurrentSession() : null);
+    const profile = await getCurrentProfile() || (!sessionUser ? await refreshCurrentSession() : null);
 
-    // Allow an allowlisted admin to enter through Google without requiring a
-    // customer contact field; customer OAuth accounts complete contacts below.
-    if (!profile && sessionUser && isAdminEmail(sessionUser.email)) {
-      const adminProfile = await getOrCreateProfileForAuthUser({
-        fullName: sessionUser.fullName || 'Webscribe Admin',
-        email: sessionUser.email,
-        telegram: '@admin',
-        authUserId: sessionUser.authUserId,
-      });
-      await supabase.auth.admin.updateUserById(sessionUser.authUserId, {
-        user_metadata: {
-          full_name: adminProfile.fullName,
-          telegram: adminProfile.telegram,
-          whatsapp: adminProfile.whatsapp || '',
-        },
-      });
-      await updateProfileClaims(sessionUser.authUserId, adminProfile.id, adminProfile.role);
-      profile = (await refreshCurrentSession()) || { ...adminProfile, role: 'admin' };
-    }
-
-    if (!profile) {
+    if (!profile || !isAdminEmail(profile.email)) {
       const { data, error } = await supabase
         .from('services')
         .select('*')
@@ -332,11 +195,6 @@ export async function getBootstrapDataAction(): Promise<ActionResult<{
         ok: true,
         data: {
           profile: null,
-          profileCompletionRequired: Boolean(sessionUser),
-          profileDraft: sessionUser ? {
-            fullName: sessionUser.fullName || 'Google Customer',
-            email: sessionUser.email,
-          } : null,
           services: (data || []).map(mapServiceRow),
           orders: [],
           tickets: [],
@@ -348,55 +206,27 @@ export async function getBootstrapDataAction(): Promise<ActionResult<{
       };
     }
 
-    if (profile.role === 'admin' || isAdminEmail(profile.email)) {
-      const [orders, services, accounts, fulfilledCount, userCount] = await Promise.all([
-        supabase.from('orders').select('*').neq('payment_status', 'completed').or(`expires_at.is.null,expires_at.gt.${new Date().toISOString()}`).order('created_at', { ascending: false }),
-        supabase.from('services').select('*').eq('is_active', true).order('title', { ascending: true }),
-        supabase.from('account_credentials').select('*').eq('status', 'available').gt('expires_at', new Date().toISOString()).order('created_at', { ascending: false }),
-        supabase.from('orders').select('id', { count: 'exact', head: true }).eq('payment_status', 'completed'),
-        supabase.from('profiles').select('id', { count: 'exact', head: true }),
-      ]);
-      for (const result of [orders, services, accounts, fulfilledCount, userCount]) {
-        if (result.error) throw result.error;
-      }
-      return {
-        ok: true,
-        data: {
-          profile,
-          profileCompletionRequired: false,
-          profileDraft: null,
-          services: (services.data || []).map(mapServiceRow),
-          orders: (orders.data || []).map(mapOrderRow),
-          tickets: [],
-          users: [],
-          accounts: (accounts.data || []).map(row => mapAccountRow(row as Record<string, unknown>)),
-          fulfilledTotal: fulfilledCount.count || 0,
-          userTotal: userCount.count || 0,
-        },
-      };
+    const [orders, services, accounts, fulfilledCount, userCount] = await Promise.all([
+      supabase.from('orders').select('*').neq('payment_status', 'completed').or(`expires_at.is.null,expires_at.gt.${new Date().toISOString()}`).order('created_at', { ascending: false }),
+      supabase.from('services').select('*').eq('is_active', true).order('title', { ascending: true }),
+      supabase.from('account_credentials').select('*').eq('status', 'available').gt('expires_at', new Date().toISOString()).order('created_at', { ascending: false }),
+      supabase.from('orders').select('id', { count: 'exact', head: true }).eq('payment_status', 'completed'),
+      supabase.from('profiles').select('id', { count: 'exact', head: true }),
+    ]);
+    for (const result of [orders, services, accounts, fulfilledCount, userCount]) {
+      if (result.error) throw result.error;
     }
-
-    const { data: services, error: servicesError } = await supabase
-      .from('services')
-      .select('*')
-      .eq('is_active', true)
-      .order('is_popular', { ascending: false })
-      .order('title', { ascending: true });
-    if (servicesError) throw servicesError;
-
     return {
       ok: true,
       data: {
         profile,
-        profileCompletionRequired: false,
-        profileDraft: null,
-        services: (services || []).map(mapServiceRow),
-        orders: [],
+        services: (services.data || []).map(mapServiceRow),
+        orders: (orders.data || []).map(mapOrderRow),
         tickets: [],
-        users: [profile],
-        accounts: [],
-        fulfilledTotal: 0,
-        userTotal: 0,
+        users: [],
+        accounts: (accounts.data || []).map(row => mapAccountRow(row as Record<string, unknown>)),
+        fulfilledTotal: fulfilledCount.count || 0,
+        userTotal: userCount.count || 0,
       },
     };
 
@@ -459,116 +289,6 @@ const getOrCreateProfileForAuthUser = async (input: {
   return mapProfileRow(data);
 };
 
-export async function completeGoogleProfileAction(input: {
-  telegram?: string;
-  whatsapp?: string;
-}): Promise<ActionResult<UserProfile>> {
-  try {
-    const sessionUser = await getCurrentSessionUser();
-    if (!sessionUser) throw new Error('Authentication required.');
-
-    const existingProfile = await getCurrentProfile();
-    if (existingProfile) return { ok: true, data: existingProfile };
-
-    const profile = await getOrCreateProfileForAuthUser({
-      fullName: sessionUser.fullName || 'Google Customer',
-      email: sessionUser.email,
-      telegram: isAdminEmail(sessionUser.email) ? '@admin' : input.telegram,
-      whatsapp: input.whatsapp,
-      authUserId: sessionUser.authUserId,
-    });
-    const supabase = getSupabaseAdmin();
-    const { error: metadataError } = await supabase.auth.admin.updateUserById(sessionUser.authUserId, {
-      user_metadata: {
-        full_name: profile.fullName,
-        telegram: profile.telegram,
-        whatsapp: profile.whatsapp || '',
-      },
-    });
-    if (metadataError) throw metadataError;
-    await updateProfileClaims(sessionUser.authUserId, profile.id, profile.role);
-
-    const refreshedProfile = await refreshCurrentSession();
-    if (!refreshedProfile) throw new Error('Unable to finish profile setup.');
-    revalidatePath('/');
-    return { ok: true, data: isAdminEmail(refreshedProfile.email) ? { ...refreshedProfile, role: 'admin' } : refreshedProfile };
-  } catch (error) {
-    return fail(error);
-  }
-}
-
-export async function registerProfileAction(input: {
-  fullName: string;
-  email: string;
-  telegram?: string;
-  whatsapp?: string;
-  password: string;
-}): Promise<ActionResult<{ profile: UserProfile | null; requiresEmailConfirmation: boolean }>> {
-  try {
-    const supabase = getSupabaseAdmin();
-    const email = normalizeInputEmail(input.email);
-    const password = validateUserPassword(input.password);
-    const fullName = normalizeFullName(input.fullName);
-    const telegram = normalizeTelegram(input.telegram);
-    const whatsapp = normalizeWhatsapp(input.whatsapp);
-    if (!telegram && !whatsapp) throw actionError('Telegram username or WhatsApp number is required.');
-
-    if (isAdminEmail(email)) {
-      throw actionError('Admin accounts cannot be created from customer registration.');
-    }
-
-    const { data: existingProfile, error: profileReadError } = await supabase
-      .from('profiles')
-      .select('id')
-      .eq('email', email)
-      .maybeSingle();
-
-    if (profileReadError) throw profileReadError;
-    if (existingProfile) throw actionError('A profile already exists for this email.');
-
-    const normalizedTelegram = telegram || '';
-    const { data: authData, error: authError } = await getSupabaseAuth().auth.signUp({
-      email,
-      password,
-      options: {
-        data: {
-          full_name: fullName,
-          telegram: telegram ? normalizedTelegram : '',
-          whatsapp: whatsapp || null,
-        },
-      },
-    });
-
-    if (authError) {
-      throw actionError(authError.message.toLowerCase().includes('already')
-        ? 'An account already exists for this email.'
-        : 'Unable to create the account. Please check the details and try again.');
-    }
-    if (!authData.user) throw new Error('Unable to create authentication user.');
-    if (!authData.session) {
-      return { ok: true, data: { profile: null, requiresEmailConfirmation: true } };
-    }
-
-    try {
-      const profile = await getOrCreateProfileForAuthUser({
-        fullName,
-        email,
-        telegram: telegram ? normalizedTelegram : undefined,
-        whatsapp,
-        authUserId: authData.user.id,
-      });
-      await refreshSessionWithProfileClaims(authData.user.id, email, password, profile.id, profile.role);
-      return { ok: true, data: { profile, requiresEmailConfirmation: false } };
-    } catch (error) {
-      await supabase.from('profiles').delete().eq('auth_user_id', authData.user.id);
-      await supabase.auth.admin.deleteUser(authData.user.id);
-      throw error;
-    }
-  } catch (error) {
-    return fail(error);
-  }
-}
-
 export async function loginAction(input: {
   email: string;
   password: string;
@@ -576,13 +296,14 @@ export async function loginAction(input: {
   try {
     const supabase = getSupabaseAdmin();
     const email = normalizeInputEmail(input.email);
+    if (!isAdminEmail(email)) throw actionError('This sign-in is for administrators only.');
     const password = asString(input.password, 'password');
 
     const authClient = getSupabaseAuth();
     let signIn = await authClient.auth.signInWithPassword({ email, password });
 
     const configuredAdminPassword = getAdminPassword();
-    if (signIn.error && isAdminEmail(email) && configuredAdminPassword && password === configuredAdminPassword) {
+    if (signIn.error && configuredAdminPassword && password === configuredAdminPassword) {
       const created = await supabase.auth.admin.createUser({
         email,
         password,
@@ -603,9 +324,9 @@ export async function loginAction(input: {
     }
 
     const profile = await getOrCreateProfileForAuthUser({
-      fullName: String(signIn.data.user.user_metadata?.full_name || (isAdminEmail(email) ? 'Webscribe Admin' : 'Webscribe Customer')),
+      fullName: String(signIn.data.user.user_metadata?.full_name || 'Webscribe Admin'),
       email,
-      telegram: String(signIn.data.user.user_metadata?.telegram || (isAdminEmail(email) ? '@admin' : '')),
+      telegram: String(signIn.data.user.user_metadata?.telegram || '@admin'),
       whatsapp: typeof signIn.data.user.user_metadata?.whatsapp === 'string' ? signIn.data.user.user_metadata.whatsapp : undefined,
       authUserId: signIn.data.user.id,
     });
@@ -627,7 +348,7 @@ export async function loginAction(input: {
     } else {
       await refreshSessionWithProfileClaims(signIn.data.user.id, email, password, profile.id, profile.role);
     }
-    return { ok: true, data: isAdminEmail(email) ? { ...profile, role: 'admin' as const } : profile };
+    return { ok: true, data: { ...profile, role: 'admin' as const } };
   } catch (error) {
     return fail(error);
   }
@@ -692,33 +413,6 @@ export async function updateProfileRoleAction(input: {
   }
 }
 
-export async function updateOwnProfileAction(input: { telegram?: string; whatsapp?: string; oldPassword?: string; newPassword?: string }): Promise<ActionResult<UserProfile>> {
-  try {
-    const current = await requireCurrentProfile();
-    const sessionUser = await getCurrentSessionUser();
-    if (!sessionUser) throw new Error('Authentication required.');
-    const telegram = normalizeTelegram(input.telegram);
-    const whatsapp = normalizeWhatsapp(input.whatsapp);
-    if (!telegram && !whatsapp) throw actionError('Telegram username or WhatsApp number is required.');
-    const supabase = getSupabaseAdmin();
-    if (input.newPassword) {
-      const oldPassword = asString(input.oldPassword, 'oldPassword');
-      const verified = await getSupabaseAuth().auth.signInWithPassword({ email: current.email, password: oldPassword });
-      if (verified.error) throw actionError('Old password is incorrect.');
-      validateUserPassword(input.newPassword, 'New password');
-      const { error } = await supabase.auth.admin.updateUserById(sessionUser.authUserId, { password: input.newPassword });
-      if (error) throw error;
-    }
-    const { data, error } = await supabase.from('profiles').update({ telegram: telegram || '', whatsapp: whatsapp || null }).eq('id', current.id).select('*').single();
-    if (error) throw error;
-    const { error: metadataError } = await supabase.auth.admin.updateUserById(sessionUser.authUserId, { user_metadata: { full_name: current.fullName, telegram: telegram || '', whatsapp: whatsapp || '' } });
-    if (metadataError) throw metadataError;
-    const refreshedProfile = await refreshCurrentSession();
-    revalidatePath('/');
-    return { ok: true, data: refreshedProfile || mapProfileRow(data) };
-  } catch (error) { return fail(error); }
-}
-
 export async function upsertServiceAction(input: {
   adminEmail: string;
   service: Service;
@@ -738,6 +432,7 @@ export async function upsertServiceAction(input: {
         description: asOptionalString(service.description) || null,
         dos: asOptionalString(service.dos) || null,
         donts: asOptionalString(service.donts) || null,
+        delivery_time: asOptionalString(service.deliveryTime) || null,
         original_price: service.originalPrice ?? service.regularPrice,
         our_price: service.ourPrice ?? service.regularPrice,
         regular_price: service.ourPrice ?? service.regularPrice,
@@ -789,33 +484,6 @@ export async function deleteServiceAction(serviceId: string): Promise<ActionResu
     revalidatePath('/');
     revalidatePath('/admin');
     return { ok: true, data: null };
-  } catch (error) {
-    return fail(error);
-  }
-}
-
-export async function updateServiceStockAction(input: {
-  adminEmail: string;
-  serviceId: string;
-  stockCount: number;
-}): Promise<ActionResult<Service>> {
-  try {
-    await requireCurrentAdmin();
-    const stockCount = Math.max(0, Math.floor(Number(input.stockCount) || 0));
-    const stockStatus = stockCount === 0 ? 'out_of_stock' : stockCount <= 3 ? 'low_stock' : 'in_stock';
-    const supabase = getSupabaseAdmin();
-
-    const { data, error } = await supabase
-      .from('services')
-      .update({ stock_count: stockCount, stock_status: stockStatus })
-      .eq('id', asString(input.serviceId, 'serviceId'))
-      .select('*')
-      .single();
-
-    if (error) throw error;
-    revalidatePath('/');
-    revalidatePath('/admin');
-    return { ok: true, data: mapServiceRow(data) };
   } catch (error) {
     return fail(error);
   }
@@ -1001,9 +669,6 @@ export async function updateOrderFulfillmentAction(input: { orderId: string; ful
     const supabase = getSupabaseAdmin();
     const { data: existing, error: lookupError } = await supabase.from('orders').select('*').eq('id', id).single();
     if (lookupError) throw lookupError;
-    if (input.fulfilled && !existing.account_id) {
-      throw actionError('Assign an account before marking this order fulfilled.');
-    }
     if (input.fulfilled && existing.payment_status === 'cancelled') {
       throw actionError('A rejected order cannot be marked fulfilled.');
     }
@@ -1033,59 +698,54 @@ export async function updateOrderFulfillmentAction(input: { orderId: string; ful
 }
 
 export async function createOrderAction(input: {
-  profileId: string;
   serviceId: string;
   variantId?: string;
+  customerName: string;
+  customerTelegram: string;
+  customerWhatsapp: string;
   contactMethod?: 'telegram' | 'whatsapp';
   utrNumber: string;
 }): Promise<ActionResult<ReturnType<typeof mapOrderRow>>> {
   try {
     const supabase = getSupabaseAdmin();
-    const currentProfile = await requireCurrentProfile();
-    const profileId = asString(input.profileId, 'profileId');
     const serviceId = asString(input.serviceId, 'serviceId');
     const utrNumber = asString(input.utrNumber, 'utrNumber');
     if (!/^\d{12}$/.test(utrNumber)) {
       throw actionError('Enter a valid 12-digit UPI UTR number.');
     }
-    if (currentProfile.id !== profileId) {
-      throw new Error('Forbidden: order profile mismatch.');
-    }
+    const customerName = normalizeFullName(input.customerName);
+    const customerTelegram = normalizeTelegram(input.customerTelegram);
+    if (!customerTelegram) throw actionError('Enter your Telegram username so we can deliver the order.');
+    const customerWhatsapp = normalizeWhatsapp(input.customerWhatsapp);
+    if (!customerWhatsapp) throw actionError('Enter your WhatsApp number so we can deliver the order.');
 
-    const [{ data: profile, error: profileError }, { data: service, error: serviceError }] = await Promise.all([
-      supabase.from('profiles').select('*').eq('id', profileId).single(),
-      supabase.from('services').select('*').eq('id', serviceId).eq('is_active', true).single(),
-    ]);
+    const { data: service, error: serviceError } = await supabase
+      .from('services')
+      .select('*')
+      .eq('id', serviceId)
+      .eq('is_active', true)
+      .single();
 
-    if (profileError) throw profileError;
     if (serviceError) throw serviceError;
-    if (!profile || !service) throw actionError('Profile or service not found.');
-    if (!profile.telegram && !profile.whatsapp) throw actionError('Add a Telegram username or WhatsApp number to your profile first.');
+    if (!service) throw actionError('Service not found.');
     const contactMethod = input.contactMethod === 'whatsapp' ? 'whatsapp' : 'telegram';
-    if (contactMethod === 'telegram' && !profile.telegram) throw actionError('Add a Telegram username before choosing Telegram delivery.');
-    if (contactMethod === 'whatsapp' && !profile.whatsapp) throw actionError('Add a WhatsApp number before choosing WhatsApp delivery.');
-    if (service.stock_count <= 0) throw actionError('Service is out of stock.');
 
-    const userRole = profile.role;
     const variants = Array.isArray(service.variants) ? service.variants as Array<Record<string, unknown>> : [];
-    const selectedVariant = service.variant_mode === 'multiple'
+    const isVariantService = service.variant_mode === 'multiple' || variants.length > 0;
+    const selectedVariant = isVariantService
       ? variants.find(variant => String(variant.id ?? '') === input.variantId)
       : undefined;
-    if (service.variant_mode === 'multiple' && !selectedVariant) throw actionError('Select a service variant.');
-    const pricePaid = userRole === 'reseller'
-      ? Number(selectedVariant?.resellerPrice ?? selectedVariant?.reseller_price ?? service.reseller_price)
-      : Number(selectedVariant?.ourPrice ?? selectedVariant?.our_price ?? selectedVariant?.regularPrice ?? service.regular_price);
+    if (isVariantService && !selectedVariant) throw actionError('Select a service variant.');
+    const pricePaid = Number(selectedVariant?.ourPrice ?? selectedVariant?.our_price ?? selectedVariant?.regularPrice ?? service.regular_price);
+    const variantText = (value: unknown) => (typeof value === 'string' && value.trim() ? value.trim() : null);
     const { data: existingOrder, error: existingOrderError } = await supabase
       .from('orders')
-      .select('*')
+      .select('id')
       .eq('utr_number', utrNumber)
       .limit(1)
       .maybeSingle();
     if (existingOrderError) throw existingOrderError;
     if (existingOrder) {
-      if (existingOrder.profile_id === profile.id && existingOrder.service_id === service.id) {
-        return { ok: true, data: mapOrderRow(existingOrder) };
-      }
       throw actionError('This UTR number has already been submitted.');
     }
 
@@ -1097,23 +757,21 @@ export async function createOrderAction(input: {
       .insert({
         id: orderId,
         secret_key: secretKey,
-        profile_id: profile.id,
+        profile_id: null,
         service_id: service.id,
         service_title: service.title,
-        dos: service.dos || null,
-        donts: service.donts || null,
+        dos: variantText(selectedVariant?.description) || variantText(selectedVariant?.dos) || service.dos || null,
+        donts: variantText(selectedVariant?.donts) || service.donts || null,
         variant_id: selectedVariant ? String(selectedVariant.id) : null,
         variant_name: selectedVariant ? String(selectedVariant.name ?? '') : null,
         service_category: service.category,
-        user_role: userRole,
+        user_role: 'customer',
         price_paid: pricePaid,
         regular_price: Number(selectedVariant?.ourPrice ?? selectedVariant?.our_price ?? selectedVariant?.regularPrice ?? service.regular_price),
-        reseller_discount: userRole === 'reseller'
-          ? Number(selectedVariant?.ourPrice ?? selectedVariant?.our_price ?? selectedVariant?.regularPrice ?? service.regular_price) - pricePaid
-          : null,
-        customer_name: profile.full_name,
-        customer_telegram: profile.telegram,
-        customer_whatsapp: profile.whatsapp || null,
+        reseller_discount: null,
+        customer_name: customerName,
+        customer_telegram: customerTelegram,
+        customer_whatsapp: customerWhatsapp,
         contact_method: contactMethod,
         payment_status: 'verification_pending',
         utr_number: utrNumber,
@@ -1133,7 +791,7 @@ export async function createOrderAction(input: {
         serviceTitle: service.title,
         serviceCategory: service.category,
         serviceDescription: service.description || undefined,
-        customerName: profile.full_name,
+        customerName: mapped.customerName,
         customerTelegram: mapped.customerTelegram,
         customerWhatsapp: mapped.customerWhatsapp,
         contactMethod: mapped.contactMethod,
@@ -1149,109 +807,6 @@ export async function createOrderAction(input: {
     revalidatePath('/');
     revalidatePath('/admin');
     return { ok: true, data: mapped };
-  } catch (error) {
-    return fail(error);
-  }
-}
-
-export async function listCustomerOrdersAction(input: {
-  profileId: string;
-  page?: number;
-}): Promise<ActionResult<CustomerOrderPage>> {
-  try {
-    const supabase = getSupabaseAdmin();
-    const currentProfile = await requireCurrentProfile();
-    const requestedProfileId = asString(input.profileId, 'profileId');
-    if (currentProfile.id !== requestedProfileId) {
-      throw new Error('Forbidden: order profile mismatch.');
-    }
-
-    const expiryFilter = new Date().toISOString();
-    const countQuery = supabase
-      .from('orders')
-      .select('id', { count: 'exact', head: true })
-      .eq('profile_id', requestedProfileId)
-      .or(`expires_at.is.null,expires_at.gt.${expiryFilter}`);
-    const { count, error: countError } = await countQuery;
-    if (countError) throw countError;
-
-    const total = count || 0;
-    const totalPages = Math.max(1, Math.ceil(total / CUSTOMER_PAGE_SIZE));
-    const requestedPage = Number.isFinite(input.page) ? Math.max(1, Math.floor(input.page || 1)) : 1;
-    const page = Math.min(requestedPage, totalPages);
-    const { data, error } = await supabase
-      .from('orders')
-      .select('*')
-      .eq('profile_id', requestedProfileId)
-      .or(`expires_at.is.null,expires_at.gt.${expiryFilter}`)
-      .order('created_at', { ascending: false })
-      .order('id', { ascending: false })
-      .range((page - 1) * CUSTOMER_PAGE_SIZE, page * CUSTOMER_PAGE_SIZE - 1);
-
-    if (error) throw error;
-    return {
-      ok: true,
-      data: {
-        items: (data || []).map(mapOrderRow),
-        page,
-        pageSize: CUSTOMER_PAGE_SIZE,
-        total,
-        totalPages,
-      },
-    };
-  } catch (error) {
-    return fail(error);
-  }
-}
-
-export async function listCustomerTicketsAction(input: {
-  profileId: string;
-  page?: number;
-}): Promise<ActionResult<CustomerTicketPage>> {
-  try {
-    const supabase = getSupabaseAdmin();
-    const currentProfile = await requireCurrentProfile();
-    const requestedProfileId = asString(input.profileId, 'profileId');
-    if (currentProfile.id !== requestedProfileId) {
-      throw new Error('Forbidden: ticket profile mismatch.');
-    }
-
-    const { count, error: countError } = await supabase
-      .from('tickets')
-      .select('id, orders!inner(profile_id)', { count: 'exact', head: true })
-      .eq('orders.profile_id', requestedProfileId);
-    if (countError) throw countError;
-
-    const total = count || 0;
-    const totalPages = Math.max(1, Math.ceil(total / CUSTOMER_PAGE_SIZE));
-    const requestedPage = Number.isFinite(input.page) ? Math.max(1, Math.floor(input.page || 1)) : 1;
-    const page = Math.min(requestedPage, totalPages);
-    const { data, error } = await supabase
-      .from('tickets')
-      .select('*, orders!inner(profile_id, customer_whatsapp, contact_method)')
-      .eq('orders.profile_id', requestedProfileId)
-      .order('created_at', { ascending: false })
-      .order('id', { ascending: false })
-      .range((page - 1) * CUSTOMER_PAGE_SIZE, page * CUSTOMER_PAGE_SIZE - 1);
-    if (error) throw error;
-
-    const items = (data || []).map(row => {
-      const record = row as Record<string, unknown>;
-      const relatedOrder = record.orders && typeof record.orders === 'object' && !Array.isArray(record.orders)
-        ? record.orders as Record<string, unknown>
-        : undefined;
-      return mapTicketWithOrder(record, relatedOrder);
-    });
-    return {
-      ok: true,
-      data: {
-        items,
-        page,
-        pageSize: CUSTOMER_PAGE_SIZE,
-        total,
-        totalPages,
-      },
-    };
   } catch (error) {
     return fail(error);
   }
@@ -1306,52 +861,37 @@ export async function rejectOrderAction(input: {
 }
 
 export async function createTicketAction(input: {
-  profileId: string;
   orderId: string;
-  issueCategory: string;
   description: string;
 }): Promise<ActionResult<ReturnType<typeof mapTicketRow>>> {
   try {
     const supabase = getSupabaseAdmin();
-    const currentProfile = await requireCurrentProfile();
-    const profileId = asString(input.profileId, 'profileId');
-    if (currentProfile.id !== profileId) {
-      throw new Error('Forbidden: ticket profile mismatch.');
-    }
-
-    const { data: order, error: orderError } = await supabase
-      .from('orders')
-      .select('*')
-      .eq('id', asString(input.orderId, 'orderId'))
-      .eq('profile_id', profileId)
-      .single();
-
-    if (orderError) throw orderError;
-    if (!order) throw actionError('Order not found.');
-
-    const allowedIssueCategories = ['Account Locked', 'Invalid Password', 'Buffering / Quality', 'Other'];
-    const issueCategory = asString(input.issueCategory, 'issueCategory');
-    if (!allowedIssueCategories.includes(issueCategory)) {
-      throw actionError('Select a valid support issue type.');
-    }
+    const orderId = asString(input.orderId, 'orderId');
     const description = asString(input.description, 'description');
     if (description.length > 1500) {
       throw actionError('Ticket description must be 1500 characters or fewer.');
     }
 
-    const ticket = {
-      id: nextTicketId(),
-      order_id: order.id,
-      service_title: order.service_title,
-      customer_telegram: order.customer_telegram,
-      issue_category: issueCategory,
-      description,
-      status: 'open',
-    };
+    const { data: order, error: orderError } = await supabase
+      .from('orders')
+      .select('*')
+      .eq('id', orderId)
+      .maybeSingle();
+
+    if (orderError) throw orderError;
+    if (!order) throw actionError('Order not found. Check the order ID and try again.');
 
     const { data, error } = await supabase
       .from('tickets')
-      .insert(ticket)
+      .insert({
+        id: nextTicketId(),
+        order_id: order.id,
+        service_title: order.service_title,
+        customer_telegram: order.customer_telegram,
+        issue_category: 'Other',
+        description,
+        status: 'open',
+      })
       .select('*')
       .single();
 
@@ -1364,7 +904,6 @@ export async function createTicketAction(input: {
       message: buildTicketNotification(mapped),
     });
 
-    revalidatePath('/');
     revalidatePath('/admin');
     return { ok: true, data: mapped };
   } catch (error) {
