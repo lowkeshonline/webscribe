@@ -33,7 +33,7 @@ export const HeroConstellation: React.FC = () => {
           <ArrowRight className="w-4 h-4" />
         </button>
         <a
-          href="https://t.me/Webscibe_Reviews"
+          href="https://t.me/Webscribe_Reviews"
           target="_blank"
           rel="noopener noreferrer"
           className="ws-secondary-button h-[52px] px-7 rounded-[16px] text-[15px] font-semibold inline-flex items-center gap-2 active:scale-95 transition-transform"
