@@ -8,7 +8,7 @@ import { isAdminEmail, normalizeEmail } from '@/lib/server/authz';
 import { getAdminPassword } from '@/lib/server/env';
 import { decryptCredential, encryptCredential } from '@/lib/server/credentialCrypto';
 import { mapOrderRow, mapProfileRow, mapServiceRow, mapTicketRow } from '@/lib/server/mappers';
-import { isValidEmail, isValidFullName, isValidTelegramUsername, normalizeIndianWhatsappNumber } from '@/lib/validation';
+import { isValidAccountIdentifier, isValidEmail, isValidFullName, isValidTelegramUsername, normalizeIndianWhatsappNumber } from '@/lib/validation';
 import {
   getCurrentProfile,
   getCurrentSessionUser,
@@ -74,6 +74,12 @@ const normalizeInputEmail = (value: unknown) => {
   const email = normalizeEmail(asString(value, 'email'));
   if (!isValidEmail(email)) throw actionError('Enter a valid email address.');
   return email;
+};
+
+const normalizeAccountIdentifier = (value: unknown) => {
+  const raw = asString(value, 'account email or mobile number').replace(/[\s()-]/g, '');
+  if (!isValidAccountIdentifier(raw)) throw actionError('Enter a valid account email or mobile number.');
+  return raw.includes('@') ? normalizeEmail(raw) : raw;
 };
 
 const normalizeFullName = (value: unknown) => {
@@ -448,6 +454,7 @@ export async function upsertServiceAction(input: {
         price_starts_at: service.priceStartsAt ?? null,
         variants: service.variants || [],
         is_popular: Boolean(service.isPopular),
+        is_offer_service: Boolean(service.isOfferService),
         is_active: true,
       })
       .select('*')
@@ -566,7 +573,7 @@ export async function searchAccountCredentialsAction(input: { serviceId: string;
     await requireCurrentAdmin();
     const serviceId = asString(input.serviceId, 'serviceId');
     const query = asString(input.query, 'query').replace(/[%_,()]/g, '').trim();
-    if (!query) throw actionError('Enter an account ID or email to search.');
+    if (!query) throw actionError('Enter an account ID, email, or mobile number to search.');
     const now = new Date().toISOString();
     const pattern = `%${query}%`;
     const { data, error } = await getSupabaseAdmin()
@@ -597,8 +604,8 @@ export async function createAccountCredentialAction(input: {
     if (planVariants.length && !selectedPlan) throw actionError('Select a plan for this account.');
     const createdAt = asString(input.credentials.createdAt, 'createdAt');
     const expiresAt = asString(input.credentials.expiresAt, 'expiresAt');
-    const username = normalizeInputEmail(input.credentials.username);
-    const password = asString(input.credentials.password, 'account password');
+    const username = normalizeAccountIdentifier(input.credentials.username);
+    const password = asOptionalString(input.credentials.password);
     if (Number.isNaN(Date.parse(createdAt)) || Number.isNaN(Date.parse(expiresAt))) throw actionError('Created and expiry dates must be valid.');
     if (Date.parse(expiresAt) <= Date.parse(createdAt)) throw actionError('Expiry date must be after the created date.');
     if (Date.parse(expiresAt) <= Date.now()) throw actionError('Expiry date must be in the future.');
@@ -633,7 +640,7 @@ export async function updateAccountCredentialAction(input: { accountId: string; 
     const selectedPlan = planVariants.find(variant => String(variant.id ?? '') === String(input.credentials.variantId ?? ''));
     if (planVariants.length && !selectedPlan) throw actionError('Select a plan for this account.');
     const accountId = asString(input.accountId, 'accountId');
-    const { data: existing, error: existingError } = await supabase.from('account_credentials').select('service_id, status, assigned_order_id').eq('id', accountId).single();
+    const { data: existing, error: existingError } = await supabase.from('account_credentials').select('service_id, status, assigned_order_id, password').eq('id', accountId).single();
     if (existingError) throw existingError;
     if (existing.status === 'assigned' && existing.service_id !== serviceId) throw actionError('Unassign this account from its order before changing its service.');
     if (existing.status === 'assigned' && typeof existing.assigned_order_id === 'string') {
@@ -644,12 +651,12 @@ export async function updateAccountCredentialAction(input: { accountId: string; 
     }
     const createdAt = asString(input.credentials.createdAt, 'createdAt');
     const expiresAt = asString(input.credentials.expiresAt, 'expiresAt');
-    const username = normalizeInputEmail(input.credentials.username);
-    const password = asString(input.credentials.password, 'account password');
+    const username = normalizeAccountIdentifier(input.credentials.username);
+    const password = asOptionalString(input.credentials.password);
     if (Number.isNaN(Date.parse(createdAt)) || Number.isNaN(Date.parse(expiresAt))) throw actionError('Created and expiry dates must be valid.');
     if (Date.parse(expiresAt) <= Date.parse(createdAt)) throw actionError('Expiry date must be after the created date.');
     if (Date.parse(expiresAt) <= Date.now()) throw actionError('Expiry date must be in the future.');
-    const encryptedPassword = encryptCredential(password);
+    const encryptedPassword = password ? encryptCredential(password) : typeof existing.password === 'string' ? existing.password : null;
     const encryptedPin = encryptCredential(asOptionalString(input.credentials.pin));
     const encryptedAdditionalInfo = encryptCredential(asOptionalString(input.credentials.additionalInfo));
     const { data, error } = await supabase.from('account_credentials').update({ service_id: serviceId, service_title: service.title, variant_id: selectedPlan ? String(selectedPlan.id) : null, variant_name: selectedPlan ? String(selectedPlan.name ?? '') : null, profile_name: input.credentials.profileName || null, username, password: encryptedPassword, pin: encryptedPin, additional_info: encryptedAdditionalInfo, created_at: createdAt, expires_at: expiresAt }).eq('id', accountId).select('*').single();
@@ -861,6 +868,11 @@ export async function createOrderAction(input: {
       ? variants.find(variant => String(variant.id ?? '') === input.variantId)
       : undefined;
     if (isVariantService && !selectedVariant) throw actionError('Select a service variant.');
+    const paymentCurrency = selectedVariant?.paymentCurrency ?? selectedVariant?.payment_currency;
+    const isManualOrder = Boolean(selectedVariant?.isManualOrder ?? selectedVariant?.is_manual_order);
+    if (isManualOrder || paymentCurrency === 'percent') {
+      throw actionError('This plan is booked through Telegram. Use the Book your order button.');
+    }
     const pricePaid = Number(selectedVariant?.ourPrice ?? selectedVariant?.our_price ?? selectedVariant?.regularPrice ?? service.regular_price);
     const variantText = (value: unknown) => (typeof value === 'string' && value.trim() ? value.trim() : null);
     const { data: existingOrder, error: existingOrderError } = await supabase

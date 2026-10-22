@@ -67,9 +67,12 @@ export const mapServiceRow = (row: DbRecord): Service => ({
       description: optionalStr(item, 'description') ?? legacyPlanDescription(item),
       dos: optionalStr(item, 'dos'),
       donts: optionalStr(item, 'donts'),
+      paymentCurrency: item.paymentCurrency === 'percent' || item.payment_currency === 'percent' ? 'percent' : 'inr',
+      isManualOrder: Boolean(item.isManualOrder ?? item.is_manual_order),
     };
   }) : [],
   isPopular: bool(row, 'is_popular'),
+  isOfferService: bool(row, 'is_offer_service'),
 });
 
 export const mapOrderRow = (row: DbRecord): Order => ({

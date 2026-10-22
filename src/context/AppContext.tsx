@@ -36,6 +36,7 @@ import {
   resolveTicketAction,
   upsertServiceAction,
 } from '@/app/actions/backend';
+import { buildTelegramBookingUrl, requiresTelegramBooking } from '@/lib/planBooking';
 
 export type MobileTab = 'home' | 'catalog' | 'support' | 'admin';
 export type AdminTab = 'overview' | 'payments' | 'inventory' | 'tickets';
@@ -328,6 +329,13 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   };
 
   const openCheckout = (service: Service, variantId?: string) => {
+    const variant = variantId
+      ? (service.variants || []).find(item => item.id === variantId)
+      : (service.variants || [])[0];
+    if (requiresTelegramBooking(variant)) {
+      window.open(buildTelegramBookingUrl(service, variant, currentRole === 'reseller'), '_blank', 'noopener,noreferrer');
+      return;
+    }
     setCheckoutService(service);
     setCheckoutVariantId(variantId ?? null);
   };

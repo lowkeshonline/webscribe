@@ -42,6 +42,7 @@ create table if not exists services (
   price_starts_at integer check (price_starts_at >= 0),
   variants jsonb not null default '[]'::jsonb,
   is_popular boolean not null default false,
+  is_offer_service boolean not null default false,
   is_active boolean not null default true,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
@@ -58,6 +59,7 @@ alter table services add column if not exists original_price integer not null de
 alter table services add column if not exists our_price integer not null default 0;
 alter table services add column if not exists variant_mode text not null default 'single';
 alter table services add column if not exists price_starts_at integer;
+alter table services add column if not exists is_offer_service boolean not null default false;
 alter table services add column if not exists validity_value integer not null default 30;
 alter table services add column if not exists validity_unit text not null default 'days';
 alter table services alter column description drop not null;

@@ -11,6 +11,7 @@ If the database was created with an earlier version of the schema, run `supabase
 For older databases, run `supabase/migrations/20260911_service_guidance.sql` to remove the old structured service fields and add Do's/Don'ts guidance. For multiple-variant services, run `supabase/migrations/20260911_order_variants.sql` so checkout can persist the selected variant. Run `supabase/migrations/20260911_account_credentials.sql` to add the reusable admin account vault.
 Run `supabase/migrations/20260912_ticket_pagination.sql` on existing databases to add the status and newest-first ticket index.
 Run `supabase/migrations/20260912_order_customer_pagination.sql` on existing databases to add the composite order indexes used by fulfilled-order and customer-history pages.
+Run `supabase/migrations/20261022_offer_services.sql` on existing databases to add the offer-service flag used to hide validity and original price.
 Before production, run `supabase/migrations/20260912_production_hardening.sql`. It enables RLS, removes direct `anon`/`authenticated` table access, validates new contact/account/UTR records, adds UTR uniqueness, and installs the account timestamp trigger.
 
 The UTR uniqueness index requires existing non-null UTR values to be unique. Check before applying the hardening migration:

@@ -16,6 +16,8 @@ export type ServiceCategory = 'All' | 'Streaming' | 'Music' | 'AI & Tools' | 'Ga
 export type DeliveryMethod = 'instant' | 'telegram';
 export type ServiceVariantMode = 'single' | 'multiple';
 export type ServiceValidityUnit = 'days' | 'months';
+/** A plan is priced either in rupees or as a percentage discount. */
+export type ServicePriceCurrency = 'inr' | 'percent';
 
 export interface ServiceVariant {
   id: string;
@@ -32,6 +34,9 @@ export interface ServiceVariant {
   description?: string;
   dos?: string;
   donts?: string;
+  paymentCurrency?: ServicePriceCurrency;
+  /** Manual plans open a prefilled Telegram chat instead of checkout. */
+  isManualOrder?: boolean;
 }
 
 export type StockStatus = 'in_stock' | 'low_stock' | 'out_of_stock';
@@ -58,6 +63,8 @@ export interface Service {
   priceStartsAt?: number;
   variants?: ServiceVariant[];
   isPopular?: boolean;
+  /** Offer services hide validity and original price because they are discount listings. */
+  isOfferService?: boolean;
 }
 
 export type PaymentStatus = 

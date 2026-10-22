@@ -24,6 +24,11 @@ export const isValidIndianWhatsappNumber = (value: string) => normalizeIndianWha
 
 export const isValidEmail = (value: string) => value.trim().length <= 254 && emailPattern.test(value.trim());
 
+// Account inventory identifiers may be an email or a mobile-number login.
+const accountIdentifierPattern = /^\+?\d{6,15}$/;
+
+export const isValidAccountIdentifier = (value: string) => isValidEmail(value) || accountIdentifierPattern.test(value.trim());
+
 export const isValidFullName = (value: string) => {
   const name = value.trim().replace(/\s+/g, ' ');
   return name.length >= 2 && name.length <= 120 && fullNamePattern.test(name);

@@ -9,7 +9,8 @@ import { StyledDropdown } from '@/components/common/StyledDropdown';
 import { HighlightPoints } from '@/components/common/HighlightPoints';
 import { LoadingButton } from '@/components/common/LoadingButton';
 import { copyTextToClipboard } from '@/lib/client/clipboard';
-import { isValidEmail } from '@/lib/validation';
+import { isValidAccountIdentifier } from '@/lib/validation';
+import { planPriceLabel, showPlanValidity } from '@/lib/planBooking';
 import {
   Plus,
   Save,
@@ -27,7 +28,7 @@ import {
 } from 'lucide-react';
 
 const emptyVariantDraft = (): ServiceVariant => ({
-  id: '', name: '', originalPrice: 0, ourPrice: 0, regularPrice: 0, resellerPrice: 0, stockCount: 0, validityValue: 30, validityUnit: 'days', deliveryTime: '', description: '',
+  id: '', name: '', originalPrice: 0, ourPrice: 0, regularPrice: 0, resellerPrice: 0, stockCount: 0, validityValue: 30, validityUnit: 'days', deliveryTime: '', description: '', paymentCurrency: 'inr', isManualOrder: false,
 });
 
 const isAccountExpired = (account: AccountCredential) => !account.expiresAt || Date.parse(account.expiresAt) <= Date.now();
@@ -133,6 +134,11 @@ export const AdminDashboard: React.FC = () => {
   const assignAccountStatus = assignAccount?.status;
   const accountFormService = services.find(service => service.id === accountServiceId);
   const accountFormVariants = accountFormService?.variants || [];
+  const planEditorService = planEditor?.mode === 'service-add'
+    ? services.find(service => service.id === planEditor.serviceId)
+    : serviceDraft;
+  const planEditorIsOffer = Boolean(planEditorService?.isOfferService);
+  const planEditorIsPercent = planForm.paymentCurrency === 'percent';
   const defaultAccountVariantId = (service: Service | undefined, preferred?: string) => {
     if (preferred) return preferred;
     const variants = service?.variants || [];
@@ -291,7 +297,7 @@ export const AdminDashboard: React.FC = () => {
         `${emoji ? '🔐 ' : ''}Account credentials`,
         '',
         `${bullet} Account ID: ${clean(order.accountId)}`,
-        `${bullet} Email / Username: ${clean(credentials?.username)}`,
+        `${bullet} Email / Mobile: ${clean(credentials?.username)}`,
         `${bullet} Password: ${clean(credentials?.password)}`,
         ...(credentials?.pin ? [`${bullet} PIN: ${clean(credentials.pin)}`] : []),
         ...(order.expiresAt ? [`${bullet} Valid until: ${new Date(order.expiresAt).toLocaleDateString('en-IN')}`] : []),
@@ -442,6 +448,7 @@ export const AdminDashboard: React.FC = () => {
     variantMode: 'single',
     priceStartsAt: 0,
     variants: [],
+    isOfferService: false,
   });
 
   const openServiceForm = (service?: Service) => {
@@ -494,17 +501,23 @@ export const AdminDashboard: React.FC = () => {
       setInventoryError('Enter a plan name.');
       return;
     }
-    if (!planForm.validityValue || planForm.validityValue < 1) {
+    if (!planEditorIsOffer && (!planForm.validityValue || planForm.validityValue < 1)) {
       setInventoryError('Plan validity must be at least 1 day or month.');
+      return;
+    }
+    if (planEditorIsPercent && (!planForm.ourPrice || planForm.ourPrice < 1 || planForm.ourPrice > 100)) {
+      setInventoryError('Enter a discount percentage from 1 to 100.');
       return;
     }
     const ourPrice = planForm.ourPrice ?? 0;
     const variant: ServiceVariant = {
       ...planForm,
       id: planForm.id || `variant-${Date.now()}`,
-      regularPrice: ourPrice,
-      resellerPrice: ourPrice,
-      originalPrice: planForm.originalPrice || ourPrice,
+      regularPrice: planEditorIsPercent ? 0 : ourPrice,
+      resellerPrice: planEditorIsPercent ? 0 : ourPrice,
+      originalPrice: planEditorIsPercent || planEditorIsOffer ? 0 : planForm.originalPrice || ourPrice,
+      paymentCurrency: planForm.paymentCurrency || 'inr',
+      isManualOrder: Boolean(planForm.isManualOrder),
     };
     const target = planEditor;
     if (target.mode === 'service-add') {
@@ -540,7 +553,10 @@ export const AdminDashboard: React.FC = () => {
       setInventoryError('Add at least one plan before saving this service.');
       return;
     }
-    if (variants.some(variant => !variant.validityValue || variant.validityValue < 1)) return;
+    if (!serviceDraft.isOfferService && variants.some(variant => !variant.validityValue || variant.validityValue < 1)) {
+      setInventoryError('Plan validity must be at least 1 day or month.');
+      return;
+    }
     try {
       setServiceSaving(true);
       setInventoryError(null);
@@ -592,13 +608,13 @@ export const AdminDashboard: React.FC = () => {
   const copyAccountId = copyId;
   const saveAccount = async () => {
     const service = services.find(item => item.id === accountServiceId);
-    if (!service || !accountForm.username || !accountForm.password || !accountForm.createdAt || !accountForm.expiresAt) return;
+    if (!service || !accountForm.username || !accountForm.createdAt || !accountForm.expiresAt) return;
     if (accountFormVariants.length > 0 && !accountVariantId) {
       setInventoryError('Select a plan for this account.');
       return;
     }
-    if (!isValidEmail(accountForm.username)) {
-      setInventoryError('Enter a valid account email address.');
+    if (!isValidAccountIdentifier(accountForm.username)) {
+      setInventoryError('Enter a valid account email or mobile number.');
       return;
     }
     const createdAt = Date.parse(accountForm.createdAt);
@@ -935,7 +951,7 @@ export const AdminDashboard: React.FC = () => {
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-[minmax(0,1fr)_200px_170px] gap-2">
               <div className="relative">
                 <Search className="absolute left-3.5 top-1/2 -translate-y-1/2 w-4 h-4 text-[var(--color-text-muted)]" />
-                <input value={accountSearchInput} onChange={event => setAccountSearchInput(event.target.value)} placeholder="Search account ID, email, or order ID" aria-label="Search accounts" className="w-full h-11 pl-10 pr-10 rounded-[12px] ws-input text-xs" />
+                <input value={accountSearchInput} onChange={event => setAccountSearchInput(event.target.value)} placeholder="Search account ID, email, mobile, or order ID" aria-label="Search accounts" className="w-full h-11 pl-10 pr-10 rounded-[12px] ws-input text-xs" />
                 {accountSearchInput && (
                   <button type="button" onClick={() => setAccountSearchInput('')} aria-label="Clear account search" className="absolute right-3 top-1/2 -translate-y-1/2 w-6 h-6 rounded-[8px] ws-chip flex items-center justify-center text-[var(--color-text-muted)] hover:text-[var(--color-text-primary)]">
                     <X className="w-3.5 h-3.5" />
@@ -954,7 +970,7 @@ export const AdminDashboard: React.FC = () => {
                   <tr>
                     <th className="px-3 py-3 font-semibold">Account ID</th>
                     <th className="px-3 py-3 font-semibold">Service</th>
-                    <th className="px-3 py-3 font-semibold">Email</th>
+                    <th className="px-3 py-3 font-semibold">Email / Mobile</th>
                     <th className="px-3 py-3 font-semibold">Status</th>
                     <th className="px-3 py-3 font-semibold">Order</th>
                     <th className="px-3 py-3 font-semibold text-right">Actions</th>
@@ -1023,8 +1039,8 @@ export const AdminDashboard: React.FC = () => {
                   {accountFormVariants.length > 0 && (
                     <StyledDropdown className="sm:col-span-2" value={accountVariantId} onChange={setAccountVariantId} placeholder="Plan" ariaLabel="Plan" options={accountFormVariants.map(variant => ({ value: variant.id, label: variant.name }))} buttonClassName="h-12 px-3.5 rounded-[14px] text-xs" />
                   )}
-                  <input type="email" inputMode="email" maxLength={254} value={accountForm.username || ''} onChange={event => setAccountForm(prev => ({ ...prev, username: event.target.value.replace(/\s/g, '').slice(0, 254) }))} pattern="[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}" title="Enter a valid account email address." placeholder="Account email" className="h-12 px-3.5 rounded-[14px] ws-input" />
-                  <input value={accountForm.password || ''} onChange={event => setAccountForm(prev => ({ ...prev, password: event.target.value }))} placeholder="Account password" className="h-12 px-3.5 rounded-[14px] ws-input" />
+                  <input type="text" inputMode="text" maxLength={254} value={accountForm.username || ''} onChange={event => setAccountForm(prev => ({ ...prev, username: event.target.value.replace(/\s/g, '').slice(0, 254) }))} title="Enter a valid account email or mobile number." placeholder="Account email or mobile number" className="h-12 px-3.5 rounded-[14px] ws-input" />
+                  <input value={accountForm.password || ''} onChange={event => setAccountForm(prev => ({ ...prev, password: event.target.value }))} placeholder="Account password (optional)" className="h-12 px-3.5 rounded-[14px] ws-input" />
                   <input type="date" required value={accountForm.createdAt || ''} onChange={event => setAccountForm(prev => ({ ...prev, createdAt: event.target.value }))} aria-label="Created date" className="h-12 px-3.5 rounded-[14px] ws-input" />
                   <input type="date" required value={accountForm.expiresAt || ''} onChange={event => setAccountForm(prev => ({ ...prev, expiresAt: event.target.value }))} aria-label="Expiry date" className="h-12 px-3.5 rounded-[14px] ws-input" />
                   <input value={accountForm.profileName || ''} onChange={event => setAccountForm(prev => ({ ...prev, profileName: event.target.value }))} placeholder="Profile name (optional)" className="h-12 px-3.5 rounded-[14px] ws-input" />
@@ -1032,7 +1048,7 @@ export const AdminDashboard: React.FC = () => {
                 </div>
                 <div className="flex justify-end gap-2">
                   <button type="button" onClick={() => setShowAccountForm(false)} className="h-11 px-4 rounded-[12px] ws-secondary-button text-xs font-semibold">Cancel</button>
-                  <LoadingButton type="button" onClick={() => void saveAccount()} loading={accountSaving} loadingLabel="Saving..." disabled={!accountServiceId || (accountFormVariants.length > 0 && !accountVariantId) || !accountForm.username || !accountForm.password || !accountForm.createdAt || !accountForm.expiresAt} className="ws-primary-button h-11 px-4 rounded-[12px] text-xs font-semibold disabled:opacity-50">Save Account</LoadingButton>
+                  <LoadingButton type="button" onClick={() => void saveAccount()} loading={accountSaving} loadingLabel="Saving..." disabled={!accountServiceId || (accountFormVariants.length > 0 && !accountVariantId) || !accountForm.username || !accountForm.createdAt || !accountForm.expiresAt} className="ws-primary-button h-11 px-4 rounded-[12px] text-xs font-semibold disabled:opacity-50">Save Account</LoadingButton>
                 </div>
               </div>
             </div>
@@ -1048,7 +1064,7 @@ export const AdminDashboard: React.FC = () => {
                       <span className="font-mono-code text-xs font-semibold text-[var(--color-brand-violet)]">{assignAccount.id}</span>
                       <button type="button" onClick={() => void copyId(assignAccount.id)} aria-label={`Copy account ${assignAccount.id}`} className="ws-chip w-7 h-7 rounded-[8px] flex items-center justify-center shrink-0">{copiedId === assignAccount.id ? <Check className="w-3.5 h-3.5 text-[var(--color-success)]" /> : <Copy className="w-3.5 h-3.5" />}</button>
                     </div>
-                    <p className="text-[11px] text-[var(--color-text-muted)]">{assignAccount.serviceTitle || 'No service'}{assignAccount.variantName ? ` · ${assignAccount.variantName}` : ''} · {assignAccount.username || 'No email'}</p>
+                    <p className="text-[11px] text-[var(--color-text-muted)]">{assignAccount.serviceTitle || 'No service'}{assignAccount.variantName ? ` · ${assignAccount.variantName}` : ''} · {assignAccount.username || 'No identifier'}</p>
                   </div>
                   <button type="button" onClick={() => { setAssignTargetId(null); setAssignError(null); }} aria-label="Close assignment dialog" className="w-10 h-10 rounded-[12px] ws-secondary-button flex items-center justify-center shrink-0"><X className="w-4 h-4" /></button>
                 </div>
@@ -1116,6 +1132,16 @@ export const AdminDashboard: React.FC = () => {
                   <label className="block text-[11px] font-semibold text-[var(--color-text-muted)] mb-1.5">Image URL</label>
                   <input type="url" value={serviceDraft.logoUrl || ''} onChange={e => updateDraft('logoUrl', e.target.value)} placeholder="https://example.com/logo.png" className="w-full h-12 px-3.5 rounded-[14px] ws-input" />
                 </div>
+                <div className="sm:col-span-2">
+                  <label className="block text-[11px] font-semibold text-[var(--color-text-muted)] mb-1.5">Service type</label>
+                  <StyledDropdown
+                    value={serviceDraft.isOfferService ? 'offer' : 'regular'}
+                    onChange={value => updateDraft('isOfferService', value === 'offer')}
+                    ariaLabel="Service type"
+                    options={[{ value: 'regular', label: 'Regular service' }, { value: 'offer', label: 'Offer service — hide validity and original price' }]}
+                    buttonClassName="h-12 px-3.5 rounded-[14px] text-xs"
+                  />
+                </div>
               </div>
 
               <div className="p-4 ws-panel-muted space-y-3">
@@ -1128,7 +1154,9 @@ export const AdminDashboard: React.FC = () => {
                     <div className="min-w-0">
                       <span className="block font-semibold text-[var(--color-text-primary)] truncate">{variant.name || 'Untitled plan'}</span>
                       <span className="block text-[11px] text-[var(--color-text-muted)] truncate">
-                        ₹{variant.ourPrice ?? variant.regularPrice} • {variant.validityValue} {variant.validityUnit}
+                        {planPriceLabel(variant)}
+                        {showPlanValidity(serviceDraft) ? ` • ${variant.validityValue} ${variant.validityUnit}` : ''}
+                        {variant.isManualOrder ? ' • Manual order' : ''}
                         {variant.deliveryTime ? ` • ${variant.deliveryTime}` : ''}
                       </span>
                     </div>
@@ -1159,20 +1187,44 @@ export const AdminDashboard: React.FC = () => {
                     <input value={planForm.name} onChange={e => updatePlanForm('name', e.target.value)} placeholder="e.g. 4 screens · 1 month" className="w-full h-12 px-3.5 rounded-[14px] ws-input" />
                   </div>
                   <div>
-                    <label className="block text-[11px] font-semibold text-[var(--color-text-muted)] mb-1.5">Price (₹)</label>
-                    <input type="number" min="0" value={numberInputValue(planForm.ourPrice)} onChange={e => updatePlanForm('ourPrice', Number(e.target.value) || 0)} placeholder="499" className="w-full h-12 px-3.5 rounded-[14px] ws-input" />
+                    <label className="block text-[11px] font-semibold text-[var(--color-text-muted)] mb-1.5">Payment currency</label>
+                    <StyledDropdown
+                      value={planForm.paymentCurrency || 'inr'}
+                      onChange={value => updatePlanForm('paymentCurrency', value as ServiceVariant['paymentCurrency'])}
+                      ariaLabel="Payment currency"
+                      options={[{ value: 'inr', label: 'INR (₹)' }, { value: 'percent', label: 'Percentage (%)' }]}
+                      buttonClassName="h-12 px-3.5 rounded-[14px] text-xs"
+                    />
                   </div>
+                  <label className="flex items-center gap-2.5 h-12 mt-[22px] px-3.5 rounded-[14px] border border-[var(--color-card-border)] cursor-pointer text-[11px] text-[var(--color-text-secondary)]">
+                    <input type="checkbox" checked={Boolean(planForm.isManualOrder)} onChange={event => updatePlanForm('isManualOrder', event.target.checked)} className="w-4 h-4 accent-[var(--color-brand-violet)]" />
+                    Manual order
+                  </label>
                   <div>
-                    <label className="block text-[11px] font-semibold text-[var(--color-text-muted)] mb-1.5">Original price (₹)</label>
-                    <input type="number" min="0" value={numberInputValue(planForm.originalPrice)} onChange={e => updatePlanForm('originalPrice', Number(e.target.value) || 0)} placeholder="799" className="w-full h-12 px-3.5 rounded-[14px] ws-input" />
+                    <label className="block text-[11px] font-semibold text-[var(--color-text-muted)] mb-1.5">{planEditorIsPercent ? 'Discount (%)' : 'Price (₹)'}</label>
+                    <input type="number" min={planEditorIsPercent ? '1' : '0'} max={planEditorIsPercent ? '100' : undefined} value={numberInputValue(planForm.ourPrice)} onChange={e => updatePlanForm('ourPrice', Number(e.target.value) || 0)} placeholder={planEditorIsPercent ? '20' : '499'} className="w-full h-12 px-3.5 rounded-[14px] ws-input" />
                   </div>
-                  <div className="col-span-2">
-                    <label className="block text-[11px] font-semibold text-[var(--color-text-muted)] mb-1.5">Validity</label>
-                    <div className="flex gap-2">
-                      <input type="number" min="1" value={numberInputValue(planForm.validityValue)} onChange={e => updatePlanForm('validityValue', Number(e.target.value) || 0)} placeholder="30" className="min-w-0 flex-1 h-12 px-3.5 rounded-[14px] ws-input" />
-                      <StyledDropdown className="w-28 shrink-0" value={planForm.validityUnit || 'days'} onChange={value => updatePlanForm('validityUnit', value as ServiceVariant['validityUnit'])} ariaLabel="Plan validity unit" options={[{ value: 'days', label: 'Days' }, { value: 'months', label: 'Months' }]} buttonClassName="h-12 px-3.5 rounded-[14px] text-xs" />
+                  {!planEditorIsPercent && !planEditorIsOffer && (
+                    <div>
+                      <label className="block text-[11px] font-semibold text-[var(--color-text-muted)] mb-1.5">Original price (₹)</label>
+                      <input type="number" min="0" value={numberInputValue(planForm.originalPrice)} onChange={e => updatePlanForm('originalPrice', Number(e.target.value) || 0)} placeholder="799" className="w-full h-12 px-3.5 rounded-[14px] ws-input" />
                     </div>
-                  </div>
+                  )}
+                  {!planEditorIsOffer && (
+                    <div className="col-span-2">
+                      <label className="block text-[11px] font-semibold text-[var(--color-text-muted)] mb-1.5">Validity</label>
+                      <div className="flex gap-2">
+                        <input type="number" min="1" value={numberInputValue(planForm.validityValue)} onChange={e => updatePlanForm('validityValue', Number(e.target.value) || 0)} placeholder="30" className="min-w-0 flex-1 h-12 px-3.5 rounded-[14px] ws-input" />
+                        <StyledDropdown className="w-28 shrink-0" value={planForm.validityUnit || 'days'} onChange={value => updatePlanForm('validityUnit', value as ServiceVariant['validityUnit'])} ariaLabel="Plan validity unit" options={[{ value: 'days', label: 'Days' }, { value: 'months', label: 'Months' }]} buttonClassName="h-12 px-3.5 rounded-[14px] text-xs" />
+                      </div>
+                    </div>
+                  )}
+                  {planEditorIsPercent && (
+                    <p className="col-span-2 text-[11px] text-[var(--color-text-muted)]">Percentage plans show “{planForm.ourPrice || 0}% OFF” and use the Book your order Telegram button.</p>
+                  )}
+                  {planForm.isManualOrder && !planEditorIsPercent && (
+                    <p className="col-span-2 text-[11px] text-[var(--color-text-muted)]">Manual orders use the Book your order Telegram button instead of UPI checkout.</p>
+                  )}
                   <div className="col-span-2">
                     <label className="block text-[11px] font-semibold text-[var(--color-text-muted)] mb-1.5">Description — one point per line</label>
                     <textarea value={planForm.description || ''} onChange={e => updatePlanForm('description', e.target.value)} placeholder={'4K Ultra HD streaming\nWatch on 4 devices at once'} className="w-full px-3.5 py-3 rounded-[14px] ws-input min-h-28 text-xs" />
@@ -1208,8 +1260,11 @@ export const AdminDashboard: React.FC = () => {
                       {service.title}
                     </h4>
                     <p className="text-xs text-[var(--color-text-muted)]">
-                      ₹{service.ourPrice ?? service.regularPrice}
-                      {service.originalPrice ? ` (was ₹${service.originalPrice})` : ''} • {service.variantMode === 'multiple' ? `${(service.variants || []).length} plans` : `${service.validityValue} ${service.validityUnit}`}
+                      {planPriceLabel(service.variants?.[0]) || `₹${service.ourPrice ?? service.regularPrice}`}
+                      {!service.isOfferService && service.variants?.[0]?.paymentCurrency !== 'percent' && service.originalPrice ? ` (was ₹${service.originalPrice})` : ''}
+                      {service.isOfferService
+                        ? ' • Offer service'
+                        : ` • ${service.variantMode === 'multiple' ? `${(service.variants || []).length} plans` : `${service.validityValue} ${service.validityUnit}`}`}
                       {service.deliveryTime ? ` • ${service.deliveryTime}` : ''}
                     </p>
                   </div>

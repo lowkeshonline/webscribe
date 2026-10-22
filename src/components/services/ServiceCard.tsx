@@ -5,6 +5,7 @@ import { Service, ServiceVariant } from '@/types';
 import { useApp } from '@/context/AppContext';
 import { ChevronDown, X } from 'lucide-react';
 import { HighlightPoints } from '@/components/common/HighlightPoints';
+import { buildTelegramBookingUrl, isPercentPlan, planPriceLabel, requiresTelegramBooking, showPlanValidity } from '@/lib/planBooking';
 
 interface ServiceCardProps {
   service: Service;
@@ -18,10 +19,16 @@ export const ServiceCard: React.FC<ServiceCardProps> = ({ service }) => {
   const [plansOpen, setPlansOpen] = useState(false);
 
   const isReseller = currentRole === 'reseller';
-  const priceOf = (variant: ServiceVariant) => (isReseller ? variant.resellerPrice : variant.ourPrice ?? variant.regularPrice);
+  const priceOf = (variant: ServiceVariant) => {
+    if (isPercentPlan(variant)) return variant.ourPrice ?? variant.regularPrice;
+    return isReseller ? variant.resellerPrice : variant.ourPrice ?? variant.regularPrice;
+  };
   const selectedVariant = variants.find(variant => variant.id === selectedVariantId) || variants[0];
   const cheapestVariant = variants.length
-    ? variants.reduce((cheapest, variant) => (priceOf(variant) < priceOf(cheapest) ? variant : cheapest))
+    ? variants.reduce((cheapest, variant) => {
+        if (isPercentPlan(cheapest) !== isPercentPlan(variant)) return cheapest;
+        return priceOf(variant) < priceOf(cheapest) ? variant : cheapest;
+      })
     : undefined;
   const displayVariant = hasVariants ? cheapestVariant : variants[0];
   const ourPrice = displayVariant ? priceOf(displayVariant) : service.ourPrice ?? service.regularPrice;
@@ -30,6 +37,19 @@ export const ServiceCard: React.FC<ServiceCardProps> = ({ service }) => {
   const discountPercent = Math.round(((ourPrice - resellerPrice) / Math.max(1, ourPrice)) * 100);
   const selectedPrice = selectedVariant ? priceOf(selectedVariant) : ourPrice;
   const selectedOriginalPrice = selectedVariant ? selectedVariant.originalPrice ?? selectedPrice : originalPrice;
+  const displayPriceLabel = displayVariant ? planPriceLabel(displayVariant, isReseller) : `₹${ourPrice}`;
+  const selectedPriceLabel = selectedVariant ? planPriceLabel(selectedVariant, isReseller) : displayPriceLabel;
+  const displayIsPercent = isPercentPlan(displayVariant);
+  const selectedIsPercent = isPercentPlan(selectedVariant);
+  const showDisplayOriginal = !service.isOfferService && !displayIsPercent;
+  const showSelectedOriginal = !service.isOfferService && !selectedIsPercent;
+  const displaySubtitle = hasVariants
+    ? `${variants.length} plans`
+    : showPlanValidity(service)
+      ? `${displayVariant?.validityValue ?? service.validityValue} ${displayVariant?.validityUnit ?? service.validityUnit}`
+      : service.isOfferService
+        ? 'Offer service'
+        : '';
 
   const ctaClass = 'h-11 min-h-11 px-[22px] rounded-[14px] text-sm font-semibold ws-primary-button hover:opacity-90 active:scale-95 transition-transform shrink-0';
 
@@ -56,7 +76,7 @@ export const ServiceCard: React.FC<ServiceCardProps> = ({ service }) => {
                 {service.title}
               </h3>
               <span className="text-xs text-[var(--color-text-muted)]">
-                {hasVariants ? `${variants.length} plans` : `${displayVariant?.validityValue ?? service.validityValue} ${displayVariant?.validityUnit ?? service.validityUnit}`}
+                {displaySubtitle}
               </span>
             </div>
           </div>
@@ -72,13 +92,15 @@ export const ServiceCard: React.FC<ServiceCardProps> = ({ service }) => {
         {/* Pricing & CTA */}
         <div className="mt-auto flex flex-wrap items-end justify-between gap-3 pt-1">
           <div className="flex items-baseline gap-2 min-w-0">
-            <span className={`font-heading font-bold text-[22px] leading-none ${isReseller ? 'text-[var(--color-brand-violet)]' : 'text-[var(--color-text-primary)]'}`}>
-              ₹{isReseller ? resellerPrice : ourPrice}
+            <span className={`font-heading font-bold text-[22px] leading-none ${isReseller && !displayIsPercent ? 'text-[var(--color-brand-violet)]' : 'text-[var(--color-text-primary)]'}`}>
+              {displayPriceLabel}
             </span>
-            <span className="text-xs text-[var(--color-text-muted)] line-through">
-              ₹{originalPrice}
-            </span>
-            {isReseller && discountPercent > 0 && (
+            {showDisplayOriginal && (
+              <span className="text-xs text-[var(--color-text-muted)] line-through">
+                ₹{originalPrice}
+              </span>
+            )}
+            {!displayIsPercent && !service.isOfferService && isReseller && discountPercent > 0 && (
               <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded-full bg-[var(--color-reseller-bg)] text-[var(--color-reseller-indigo)]">
                 {discountPercent}% OFF
               </span>
@@ -93,6 +115,15 @@ export const ServiceCard: React.FC<ServiceCardProps> = ({ service }) => {
             >
               View Plans
             </button>
+          ) : requiresTelegramBooking(displayVariant) ? (
+            <a
+              href={buildTelegramBookingUrl(service, displayVariant, isReseller)}
+              target="_blank"
+              rel="noopener noreferrer"
+              className={`${ctaClass} ml-auto inline-flex items-center justify-center`}
+            >
+              Book your order
+            </a>
           ) : (
             <button
               onClick={() => openCheckout(service, displayVariant?.id)}
@@ -172,12 +203,13 @@ export const ServiceCard: React.FC<ServiceCardProps> = ({ service }) => {
                           ) : null}
                         </span>
                         <span className="flex items-baseline gap-1.5 shrink-0">
-                          <span className={`font-heading font-bold text-sm ${isReseller ? 'text-[var(--color-brand-violet)]' : 'text-[var(--color-text-primary)]'}`}>₹{priceOf(variant)}</span>
-                          {variant.originalPrice ? <span className="text-[11px] text-[var(--color-text-muted)] line-through">₹{variant.originalPrice}</span> : null}
+                          <span className={`font-heading font-bold text-sm ${isReseller && !isPercentPlan(variant) ? 'text-[var(--color-brand-violet)]' : 'text-[var(--color-text-primary)]'}`}>{planPriceLabel(variant, isReseller)}</span>
+                          {!service.isOfferService && !isPercentPlan(variant) && variant.originalPrice ? <span className="text-[11px] text-[var(--color-text-muted)] line-through">₹{variant.originalPrice}</span> : null}
                         </span>
                       </span>
                       <span className="mt-0.5 block text-[11px] text-[var(--color-text-muted)]">
-                        {variant.validityValue} {variant.validityUnit}
+                        {showPlanValidity(service) ? `${variant.validityValue} ${variant.validityUnit}` : service.isOfferService ? 'Offer service' : ''}
+                        {variant.isManualOrder ? ' · Manual order' : ''}
                       </span>
                     </button>
                     {active && variant.description ? (
@@ -196,20 +228,33 @@ export const ServiceCard: React.FC<ServiceCardProps> = ({ service }) => {
                 <div className="min-w-0">
                   <span className="block text-[11px] text-[var(--color-text-muted)] truncate">{selectedVariant?.name}</span>
                   <div className="flex items-baseline gap-2 min-w-0">
-                    <span className={`font-heading font-bold text-[22px] leading-none ${isReseller ? 'text-[var(--color-brand-violet)]' : 'text-[var(--color-text-primary)]'}`}>
-                      ₹{selectedPrice}
+                    <span className={`font-heading font-bold text-[22px] leading-none ${isReseller && !selectedIsPercent ? 'text-[var(--color-brand-violet)]' : 'text-[var(--color-text-primary)]'}`}>
+                      {selectedPriceLabel}
                     </span>
-                    <span className="text-xs text-[var(--color-text-muted)] line-through">
-                      ₹{selectedOriginalPrice}
-                    </span>
+                    {showSelectedOriginal && (
+                      <span className="text-xs text-[var(--color-text-muted)] line-through">
+                        ₹{selectedOriginalPrice}
+                      </span>
+                    )}
                   </div>
                 </div>
-                <button
-                  onClick={buySelectedPlan}
-                  className={`${ctaClass} ml-auto`}
-                >
-                  {isReseller ? 'Bulk Order' : 'Purchase'}
-                </button>
+                {requiresTelegramBooking(selectedVariant) ? (
+                  <a
+                    href={buildTelegramBookingUrl(service, selectedVariant, isReseller)}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className={`${ctaClass} ml-auto inline-flex items-center justify-center`}
+                  >
+                    Book your order
+                  </a>
+                ) : (
+                  <button
+                    onClick={buySelectedPlan}
+                    className={`${ctaClass} ml-auto`}
+                  >
+                    {isReseller ? 'Bulk Order' : 'Purchase'}
+                  </button>
+                )}
               </div>
             </div>
           </div>
