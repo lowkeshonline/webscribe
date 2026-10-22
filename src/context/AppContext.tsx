@@ -16,6 +16,7 @@ import {
 } from '@/types';
 import {
   attachAccountToOrderAction,
+  unassignAccountFromOrderAction,
   createOrderAction,
   createAccountCredentialAction,
   createTicketAction,
@@ -101,6 +102,7 @@ interface AppContextType {
   deleteAccountCredential: (accountId: string) => Promise<void>;
   searchAccountCredentials: (serviceId: string, query: string) => Promise<AccountCredential[]>;
   attachAccountToOrder: (accountId: string, orderId: string) => Promise<void>;
+  unassignAccountFromOrder: (accountId: string) => Promise<void>;
   updateOrderFulfillment: (orderId: string, fulfilled: boolean) => Promise<void>;
 }
 
@@ -407,13 +409,13 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     setServices(prev => prev.filter(service => service.id !== serviceId));
   };
 
-  const createAccountCredential = async (service: Service, credentials: Credentials & { profileName?: string; createdAt?: string; expiresAt?: string }) => {
+  const createAccountCredential = async (service: Service, credentials: Credentials & { profileName?: string; createdAt?: string; expiresAt?: string; variantId?: string }) => {
     const result = await createAccountCredentialAction({ serviceId: service.id, serviceTitle: service.title, credentials });
     if (!result.ok) throw new Error(result.error);
     setAccountCredentials(prev => [result.data, ...prev]);
   };
 
-  const updateAccountCredential = async (accountId: string, service: Service, credentials: Credentials & { profileName?: string; createdAt?: string; expiresAt?: string }) => {
+  const updateAccountCredential = async (accountId: string, service: Service, credentials: Credentials & { profileName?: string; createdAt?: string; expiresAt?: string; variantId?: string }) => {
     const result = await updateAccountCredentialAction({ accountId, serviceId: service.id, serviceTitle: service.title, credentials });
     if (!result.ok) throw new Error(result.error);
     setAccountCredentials(prev => prev.map(account => account.id === accountId ? result.data : account));
@@ -444,6 +446,23 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       items: prev.items.map(order => order.id === orderId ? result.data : order),
     }));
     setAccountCredentials(prev => prev.map(account => account.id === accountId ? { ...account, status: 'assigned' as const, assignedOrderId: orderId } : account).map(account => account.assignedOrderId === orderId && account.id !== accountId ? { ...account, status: 'available' as const, assignedOrderId: undefined } : account));
+  };
+
+  const unassignAccountFromOrder = async (accountId: string) => {
+    const result = await unassignAccountFromOrderAction({ accountId });
+    if (!result.ok) throw new Error(result.error);
+    const updatedAccount = result.data.account;
+    const updatedOrder = result.data.order;
+    setAccountCredentials(prev => prev.some(account => account.id === accountId)
+      ? prev.map(account => account.id === accountId ? updatedAccount : account)
+      : [...prev, updatedAccount]);
+    if (updatedOrder) {
+      setOrders(prev => prev.map(order => order.id === updatedOrder.id ? updatedOrder : order));
+      setAdminFulfilledOrderPage(prev => ({
+        ...prev,
+        items: prev.items.map(order => order.id === updatedOrder.id ? updatedOrder : order),
+      }));
+    }
   };
 
   const updateOrderFulfillment = async (orderId: string, fulfilled: boolean) => {
@@ -508,6 +527,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         deleteAccountCredential,
         searchAccountCredentials,
         attachAccountToOrder,
+        unassignAccountFromOrder,
         updateOrderFulfillment,
       }}
     >

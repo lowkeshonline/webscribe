@@ -103,6 +103,8 @@ create table if not exists account_credentials (
   id text primary key,
   service_id text not null references services(id) on delete restrict,
   service_title text not null,
+  variant_id text,
+  variant_name text,
   username text,
   profile_name text,
   password text,
@@ -126,6 +128,8 @@ alter table profiles add column if not exists whatsapp text;
 alter table orders add column if not exists customer_whatsapp text;
 alter table orders add column if not exists contact_method text not null default 'telegram';
 alter table orders drop column if exists usage_instructions;
+alter table account_credentials add column if not exists variant_id text;
+alter table account_credentials add column if not exists variant_name text;
 
 alter table profiles drop constraint if exists profiles_contact_required;
 alter table profiles add constraint profiles_contact_required

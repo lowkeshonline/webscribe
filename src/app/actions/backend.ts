@@ -2,7 +2,7 @@
 
 import { randomBytes } from 'node:crypto';
 import { revalidatePath } from 'next/cache';
-import { AccountCredential, AdminOrderPage, AdminTicketPage, Service, UserProfile } from '@/types';
+import { AccountCredential, AdminOrderPage, AdminOrdersPage, AdminTicketPage, PaginatedResult, Service, UserProfile } from '@/types';
 import { getSupabaseAdmin, getSupabaseAuth } from '@/lib/server/supabaseAdmin';
 import { isAdminEmail, normalizeEmail } from '@/lib/server/authz';
 import { getAdminPassword } from '@/lib/server/env';
@@ -129,6 +129,8 @@ const mapAccountRow = (row: Record<string, unknown>): AccountCredential => ({
   id: String(row.id || ''),
   serviceId: String(row.service_id || ''),
   serviceTitle: String(row.service_title || ''),
+  variantId: typeof row.variant_id === 'string' ? row.variant_id : undefined,
+  variantName: typeof row.variant_name === 'string' ? row.variant_name : undefined,
   username: typeof row.username === 'string' ? row.username : undefined,
   profileName: typeof row.profile_name === 'string' ? row.profile_name : undefined,
   password: decryptCredential(row.password),
@@ -148,6 +150,7 @@ const mapTicketWithOrder = (row: Record<string, unknown>, order?: Record<string,
 
 const ADMIN_TICKET_PAGE_SIZE = 10;
 const ADMIN_ORDER_PAGE_SIZE = 10;
+const ADMIN_ACCOUNT_PAGE_SIZE = 10;
 
 const sanitizeTicketSearch = (value: unknown) => typeof value === 'string'
   ? value.trim().replace(/[\\%_,()]/g, '').slice(0, 100)
@@ -162,10 +165,10 @@ const sanitizeOrderSearch = (value: unknown) => typeof value === 'string'
   ? value.trim().replace(/[\\%_,()]/g, '').slice(0, 100)
   : '';
 
-// Searches fulfilled orders by order ID, account ID, or the customer's account email.
+// Searches orders by order ID, account ID, customer name, or customer contact.
 const applyOrderSearch = <T extends { or: (filters: string) => T; ilike: (col: string, pattern: string) => T }>(query: T, search: string) => {
   if (!search) return query;
-  return query.or(`id.ilike.%${search}%,account_id.ilike.%${search}%,customer_telegram.ilike.%${search}%`);
+  return query.or(`id.ilike.%${search}%,account_id.ilike.%${search}%,customer_name.ilike.%${search}%,customer_telegram.ilike.%${search}%,customer_whatsapp.ilike.%${search}%`);
 };
 
 export async function getBootstrapDataAction(): Promise<ActionResult<{
@@ -469,7 +472,6 @@ export async function deleteServiceAction(serviceId: string): Promise<ActionResu
       .select('id', { count: 'exact', head: true })
       .eq('service_id', id);
     if (accountError) throw accountError;
-    if (count) throw actionError('Remove or reassign the stored accounts for this service before deleting it.');
 
     const { count: orderCount, error: orderError } = await supabase
       .from('orders')
@@ -477,7 +479,8 @@ export async function deleteServiceAction(serviceId: string): Promise<ActionResu
       .eq('service_id', id);
     if (orderError) throw orderError;
 
-    const { error } = orderCount
+    // Stored accounts and order history reference the service, so hide it instead of deleting it.
+    const { error } = count || orderCount
       ? await supabase.from('services').update({ is_active: false }).eq('id', id)
       : await supabase.from('services').delete().eq('id', id);
     if (error) throw error;
@@ -504,6 +507,60 @@ export async function listAccountCredentialsAction(): Promise<ActionResult<Accou
   } catch (error) { return fail(error); }
 }
 
+export async function listAdminAccountsAction(input: {
+  page?: number;
+  serviceId?: string;
+  status?: 'all' | 'available' | 'assigned';
+  search?: string;
+}): Promise<ActionResult<PaginatedResult<AccountCredential>>> {
+  try {
+    await requireCurrentAdmin();
+    const supabase = getSupabaseAdmin();
+    const serviceId = typeof input.serviceId === 'string' && input.serviceId !== 'all' ? input.serviceId.trim() : '';
+    const status = input.status === 'available' || input.status === 'assigned' ? input.status : 'all';
+    const search = typeof input.search === 'string'
+      ? input.search.trim().replace(/[\\%_,()]/g, '').slice(0, 100)
+      : '';
+
+    let countQuery = supabase.from('account_credentials').select('id', { count: 'exact', head: true });
+    if (serviceId) countQuery = countQuery.eq('service_id', serviceId);
+    if (status !== 'all') countQuery = countQuery.eq('status', status);
+    if (search) countQuery = countQuery.or(`id.ilike.%${search}%,username.ilike.%${search}%,assigned_order_id.ilike.%${search}%`);
+    const { count, error: countError } = await countQuery;
+    if (countError) throw countError;
+
+    const total = count || 0;
+    const totalPages = Math.max(1, Math.ceil(total / ADMIN_ACCOUNT_PAGE_SIZE));
+    const requestedPage = Number.isFinite(input.page) ? Math.max(1, Math.floor(input.page || 1)) : 1;
+    const page = Math.min(requestedPage, totalPages);
+
+    let accountQuery = supabase
+      .from('account_credentials')
+      .select('*')
+      .order('created_at', { ascending: false })
+      .order('id', { ascending: false });
+    if (serviceId) accountQuery = accountQuery.eq('service_id', serviceId);
+    if (status !== 'all') accountQuery = accountQuery.eq('status', status);
+    if (search) accountQuery = accountQuery.or(`id.ilike.%${search}%,username.ilike.%${search}%,assigned_order_id.ilike.%${search}%`);
+    const { data, error } = await accountQuery.range(
+      (page - 1) * ADMIN_ACCOUNT_PAGE_SIZE,
+      page * ADMIN_ACCOUNT_PAGE_SIZE - 1,
+    );
+    if (error) throw error;
+
+    return {
+      ok: true,
+      data: {
+        items: (data || []).map(row => mapAccountRow(row as Record<string, unknown>)),
+        page,
+        pageSize: ADMIN_ACCOUNT_PAGE_SIZE,
+        total,
+        totalPages,
+      },
+    };
+  } catch (error) { return fail(error); }
+}
+
 export async function searchAccountCredentialsAction(input: { serviceId: string; query: string }): Promise<ActionResult<AccountCredential[]>> {
   try {
     await requireCurrentAdmin();
@@ -527,14 +584,17 @@ export async function searchAccountCredentialsAction(input: { serviceId: string;
 export async function createAccountCredentialAction(input: {
   serviceId: string;
   serviceTitle: string;
-  credentials: { username?: string; password?: string; pin?: string; additionalInfo?: string; profileName?: string; createdAt?: string; expiresAt?: string };
+  credentials: { username?: string; password?: string; pin?: string; additionalInfo?: string; profileName?: string; createdAt?: string; expiresAt?: string; variantId?: string };
 }): Promise<ActionResult<AccountCredential>> {
   try {
     await requireCurrentAdmin();
     const serviceId = asString(input.serviceId, 'serviceId');
     const supabase = getSupabaseAdmin();
-    const { data: service, error: serviceError } = await supabase.from('services').select('title').eq('id', serviceId).eq('is_active', true).single();
+    const { data: service, error: serviceError } = await supabase.from('services').select('title, variants').eq('id', serviceId).eq('is_active', true).single();
     if (serviceError) throw serviceError;
+    const planVariants = Array.isArray(service.variants) ? service.variants as Array<Record<string, unknown>> : [];
+    const selectedPlan = planVariants.find(variant => String(variant.id ?? '') === String(input.credentials.variantId ?? ''));
+    if (planVariants.length && !selectedPlan) throw actionError('Select a plan for this account.');
     const createdAt = asString(input.credentials.createdAt, 'createdAt');
     const expiresAt = asString(input.credentials.expiresAt, 'expiresAt');
     const username = normalizeInputEmail(input.credentials.username);
@@ -547,6 +607,8 @@ export async function createAccountCredentialAction(input: {
       service_id: serviceId,
       service_title: service.title,
       profile_name: asOptionalString(input.credentials.profileName) || null,
+      variant_id: selectedPlan ? String(selectedPlan.id) : null,
+      variant_name: selectedPlan ? String(selectedPlan.name ?? '') : null,
       username,
       password: encryptCredential(password),
       pin: encryptCredential(asOptionalString(input.credentials.pin)),
@@ -560,13 +622,26 @@ export async function createAccountCredentialAction(input: {
   } catch (error) { return fail(error); }
 }
 
-export async function updateAccountCredentialAction(input: { accountId: string; serviceId: string; serviceTitle: string; credentials: { username?: string; password?: string; pin?: string; additionalInfo?: string; profileName?: string; createdAt?: string; expiresAt?: string } }): Promise<ActionResult<AccountCredential>> {
+export async function updateAccountCredentialAction(input: { accountId: string; serviceId: string; serviceTitle: string; credentials: { username?: string; password?: string; pin?: string; additionalInfo?: string; profileName?: string; createdAt?: string; expiresAt?: string; variantId?: string } }): Promise<ActionResult<AccountCredential>> {
   try {
     await requireCurrentAdmin();
     const serviceId = asString(input.serviceId, 'serviceId');
     const supabase = getSupabaseAdmin();
-    const { data: service, error: serviceError } = await supabase.from('services').select('title').eq('id', serviceId).eq('is_active', true).single();
+    const { data: service, error: serviceError } = await supabase.from('services').select('title, variants').eq('id', serviceId).eq('is_active', true).single();
     if (serviceError) throw serviceError;
+    const planVariants = Array.isArray(service.variants) ? service.variants as Array<Record<string, unknown>> : [];
+    const selectedPlan = planVariants.find(variant => String(variant.id ?? '') === String(input.credentials.variantId ?? ''));
+    if (planVariants.length && !selectedPlan) throw actionError('Select a plan for this account.');
+    const accountId = asString(input.accountId, 'accountId');
+    const { data: existing, error: existingError } = await supabase.from('account_credentials').select('service_id, status, assigned_order_id').eq('id', accountId).single();
+    if (existingError) throw existingError;
+    if (existing.status === 'assigned' && existing.service_id !== serviceId) throw actionError('Unassign this account from its order before changing its service.');
+    if (existing.status === 'assigned' && typeof existing.assigned_order_id === 'string') {
+      const { data: assignedOrder, error: assignedOrderError } = await supabase.from('orders').select('variant_id').eq('id', existing.assigned_order_id).maybeSingle();
+      if (assignedOrderError) throw assignedOrderError;
+      const assignedVariantId = typeof assignedOrder?.variant_id === 'string' ? assignedOrder.variant_id : '';
+      if (assignedVariantId && assignedVariantId !== (selectedPlan ? String(selectedPlan.id) : '')) throw actionError('This account is assigned to an order for a different plan. Unassign it before changing its plan.');
+    }
     const createdAt = asString(input.credentials.createdAt, 'createdAt');
     const expiresAt = asString(input.credentials.expiresAt, 'expiresAt');
     const username = normalizeInputEmail(input.credentials.username);
@@ -574,8 +649,15 @@ export async function updateAccountCredentialAction(input: { accountId: string; 
     if (Number.isNaN(Date.parse(createdAt)) || Number.isNaN(Date.parse(expiresAt))) throw actionError('Created and expiry dates must be valid.');
     if (Date.parse(expiresAt) <= Date.parse(createdAt)) throw actionError('Expiry date must be after the created date.');
     if (Date.parse(expiresAt) <= Date.now()) throw actionError('Expiry date must be in the future.');
-    const { data, error } = await supabase.from('account_credentials').update({ service_id: serviceId, service_title: service.title, profile_name: input.credentials.profileName || null, username, password: encryptCredential(password), pin: encryptCredential(asOptionalString(input.credentials.pin)), additional_info: encryptCredential(asOptionalString(input.credentials.additionalInfo)), created_at: createdAt, expires_at: expiresAt }).eq('id', asString(input.accountId, 'accountId')).select('*').single();
+    const encryptedPassword = encryptCredential(password);
+    const encryptedPin = encryptCredential(asOptionalString(input.credentials.pin));
+    const encryptedAdditionalInfo = encryptCredential(asOptionalString(input.credentials.additionalInfo));
+    const { data, error } = await supabase.from('account_credentials').update({ service_id: serviceId, service_title: service.title, variant_id: selectedPlan ? String(selectedPlan.id) : null, variant_name: selectedPlan ? String(selectedPlan.name ?? '') : null, profile_name: input.credentials.profileName || null, username, password: encryptedPassword, pin: encryptedPin, additional_info: encryptedAdditionalInfo, created_at: createdAt, expires_at: expiresAt }).eq('id', accountId).select('*').single();
     if (error) throw error;
+    if (existing.status === 'assigned' && typeof existing.assigned_order_id === 'string') {
+      const { error: orderError } = await supabase.from('orders').update({ credentials: { username, password: encryptedPassword, pin: encryptedPin, additionalInfo: encryptedAdditionalInfo } }).eq('id', existing.assigned_order_id);
+      if (orderError) throw orderError;
+    }
     return { ok: true, data: mapAccountRow(data as Record<string, unknown>) };
   } catch (error) { return fail(error); }
 }
@@ -584,9 +666,9 @@ export async function deleteAccountCredentialAction(accountId: string): Promise<
   try {
     await requireCurrentAdmin();
     const id = asString(accountId, 'accountId');
-    const { data: account, error: lookupError } = await getSupabaseAdmin().from('account_credentials').select('status').eq('id', id).single();
+    const { data: account, error: lookupError } = await getSupabaseAdmin().from('account_credentials').select('status, assigned_order_id').eq('id', id).single();
     if (lookupError) throw lookupError;
-    if (account.status === 'assigned') throw actionError('Assigned accounts cannot be deleted. Reassign the order first.');
+    if (account.status === 'assigned' || account.assigned_order_id) throw actionError('This account is assigned to an order. Unassign it from Inventory before deleting.');
     const { error } = await getSupabaseAdmin().from('account_credentials').delete().eq('id', id);
     if (error) throw error;
     revalidatePath('/admin');
@@ -613,6 +695,12 @@ const attachAccountToOrder = async (accountId: string, orderId: string) => {
     const { error: normalizeError } = await supabase.from('account_credentials').update({ service_id: order.service_id, service_title: order.service_title }).eq('id', account.id);
     if (normalizeError) throw normalizeError;
   }
+  const accountVariantId = typeof account.variant_id === 'string' ? account.variant_id : '';
+  const orderVariantId = typeof order.variant_id === 'string' ? order.variant_id : '';
+  const accountVariantName = String(account.variant_name || '').trim().toLowerCase();
+  const orderVariantName = String(order.variant_name || '').trim().toLowerCase();
+  const samePlan = accountVariantId === orderVariantId || Boolean(accountVariantName && orderVariantName && accountVariantName === orderVariantName);
+  if (accountVariantId && orderVariantId && !samePlan) throw actionError('Account plan does not match this order.');
   const encryptedPassword = encryptCredential(account.password);
   const encryptedPin = encryptCredential(account.pin);
   const encryptedAdditionalInfo = encryptCredential(account.additional_info);
@@ -660,6 +748,43 @@ const attachAccountToOrder = async (accountId: string, orderId: string) => {
 export async function attachAccountToOrderAction(input: { accountId: string; orderId: string }): Promise<ActionResult<ReturnType<typeof mapOrderRow>>> {
   try { await requireCurrentAdmin(); return { ok: true, data: await attachAccountToOrder(asString(input.accountId, 'accountId'), asString(input.orderId, 'orderId')) }; }
   catch (error) { return fail(error); }
+}
+
+export async function unassignAccountFromOrderAction(input: { accountId: string }): Promise<ActionResult<{ account: AccountCredential; order: ReturnType<typeof mapOrderRow> | null }>> {
+  try {
+    await requireCurrentAdmin();
+    const supabase = getSupabaseAdmin();
+    const accountId = asString(input.accountId, 'accountId');
+    const { data: account, error: accountError } = await supabase.from('account_credentials').select('*').eq('id', accountId).single();
+    if (accountError) throw accountError;
+    const orderId = typeof account.assigned_order_id === 'string' ? account.assigned_order_id : '';
+    if (!orderId || account.status !== 'assigned') throw actionError('This account is not assigned to an order.');
+
+    const { data: released, error: releaseError } = await supabase
+      .from('account_credentials')
+      .update({ status: 'available', assigned_order_id: null })
+      .eq('id', accountId)
+      .eq('assigned_order_id', orderId)
+      .select('*')
+      .maybeSingle();
+    if (releaseError) throw releaseError;
+    if (!released) throw actionError('This account was already unassigned.');
+
+    const { data: order, error: orderError } = await supabase
+      .from('orders')
+      .update({ account_id: null, credentials: null, delivery_status: 'pending' })
+      .eq('id', orderId)
+      .eq('account_id', accountId)
+      .select('*')
+      .maybeSingle();
+    if (orderError) {
+      await supabase.from('account_credentials').update({ status: 'assigned', assigned_order_id: orderId }).eq('id', accountId).eq('status', 'available');
+      throw orderError;
+    }
+
+    revalidatePath('/admin');
+    return { ok: true, data: { account: mapAccountRow(released as Record<string, unknown>), order: order ? mapOrderRow(order) : null } };
+  } catch (error) { return fail(error); }
 }
 
 export async function updateOrderFulfillmentAction(input: { orderId: string; fulfilled: boolean }): Promise<ActionResult<ReturnType<typeof mapOrderRow>>> {
@@ -1050,6 +1175,130 @@ export async function listAdminFulfilledOrdersAction(input: {
   } catch (error) {
     return fail(error);
   }
+}
+
+export async function listAdminOrdersAction(input: {
+  page?: number;
+  paymentStatus?: 'all' | 'pending_payment' | 'verification_pending' | 'completed' | 'cancelled';
+  serviceTitle?: string;
+  search?: string;
+}): Promise<ActionResult<AdminOrdersPage>> {
+  try {
+    await requireCurrentAdmin();
+    const supabase = getSupabaseAdmin();
+    const paymentStatus = input.paymentStatus === 'pending_payment'
+      || input.paymentStatus === 'verification_pending'
+      || input.paymentStatus === 'completed'
+      || input.paymentStatus === 'cancelled'
+      ? input.paymentStatus
+      : '';
+    const serviceTitle = typeof input.serviceTitle === 'string' && input.serviceTitle.trim() && input.serviceTitle !== 'all'
+      ? input.serviceTitle.trim().slice(0, 200)
+      : '';
+    const search = sanitizeOrderSearch(input.search);
+
+    let countQuery = supabase.from('orders').select('id', { count: 'exact', head: true });
+    if (paymentStatus) countQuery = countQuery.eq('payment_status', paymentStatus);
+    if (serviceTitle) countQuery = countQuery.eq('service_title', serviceTitle);
+    countQuery = applyOrderSearch(countQuery, search);
+
+    const [countResult, serviceResult] = await Promise.all([
+      countQuery,
+      supabase.from('orders').select('service_title').order('service_title', { ascending: true }),
+    ]);
+    if (countResult.error) throw countResult.error;
+    if (serviceResult.error) throw serviceResult.error;
+
+    const total = countResult.count || 0;
+    const totalPages = Math.max(1, Math.ceil(total / ADMIN_ORDER_PAGE_SIZE));
+    const requestedPage = Number.isFinite(input.page) ? Math.max(1, Math.floor(input.page || 1)) : 1;
+    const page = Math.min(requestedPage, totalPages);
+    let orderQuery = supabase
+      .from('orders')
+      .select('*')
+      .order('created_at', { ascending: false })
+      .order('id', { ascending: false });
+    if (paymentStatus) orderQuery = orderQuery.eq('payment_status', paymentStatus);
+    if (serviceTitle) orderQuery = orderQuery.eq('service_title', serviceTitle);
+    orderQuery = applyOrderSearch(orderQuery, search);
+
+    const { data, error } = await orderQuery.range(
+      (page - 1) * ADMIN_ORDER_PAGE_SIZE,
+      page * ADMIN_ORDER_PAGE_SIZE - 1,
+    );
+    if (error) throw error;
+
+    return {
+      ok: true,
+      data: {
+        items: (data || []).map(mapOrderRow),
+        page,
+        pageSize: ADMIN_ORDER_PAGE_SIZE,
+        total,
+        totalPages,
+        paymentStatus: paymentStatus || 'all',
+        serviceTitle: serviceTitle || 'all',
+        search,
+        serviceTypes: Array.from(new Set((serviceResult.data || []).map(row => row.service_title).filter((title): title is string => typeof title === 'string' && Boolean(title)))),
+      },
+    };
+  } catch (error) {
+    return fail(error);
+  }
+}
+
+const ASSIGNABLE_ORDER_LIMIT = 25;
+
+export async function listAssignableOrdersAction(input: {
+  serviceId?: string;
+  serviceTitle?: string;
+  variantId?: string;
+  variantName?: string;
+  search?: string;
+}): Promise<ActionResult<ReturnType<typeof mapOrderRow>[]>> {
+  try {
+    await requireCurrentAdmin();
+    const serviceId = asString(input.serviceId, 'serviceId');
+    const serviceTitle = asOptionalString(input.serviceTitle);
+    const variantId = asOptionalString(input.variantId);
+    const variantName = asOptionalString(input.variantName);
+    const search = sanitizeOrderSearch(input.search);
+    const now = new Date().toISOString();
+    const buildQuery = () => applyOrderSearch(
+      getSupabaseAdmin()
+        .from('orders')
+        .select('*')
+        .neq('payment_status', 'cancelled')
+        .or(`expires_at.is.null,expires_at.gt.${now}`)
+        .order('created_at', { ascending: false })
+        .order('id', { ascending: false })
+        .limit(ASSIGNABLE_ORDER_LIMIT),
+      search,
+    );
+    const { data: idMatches, error: idError } = await buildQuery().eq('service_id', serviceId);
+    if (idError) throw idError;
+    let titleMatches: Record<string, unknown>[] = [];
+    if (serviceTitle) {
+      const { data, error } = await buildQuery().ilike('service_title', serviceTitle);
+      if (error) throw error;
+      titleMatches = (data || []) as Record<string, unknown>[];
+    }
+    const merged = new Map<string, Record<string, unknown>>();
+    [...((idMatches || []) as Record<string, unknown>[]), ...titleMatches].forEach(row => merged.set(String(row.id), row));
+    let rows = Array.from(merged.values())
+      .sort((a, b) => String(b.created_at || '').localeCompare(String(a.created_at || '')) || String(b.id).localeCompare(String(a.id)));
+    if (variantId || variantName) {
+      const wantedName = (variantName || '').trim().toLowerCase();
+      rows = rows.filter(row => {
+        const rowVariantId = typeof row.variant_id === 'string' ? row.variant_id : '';
+        const rowVariantName = String(row.variant_name || '').trim().toLowerCase();
+        if (!rowVariantId && !rowVariantName) return true;
+        if (variantId && rowVariantId) return rowVariantId === variantId;
+        return Boolean(wantedName && rowVariantName === wantedName);
+      });
+    }
+    return { ok: true, data: rows.slice(0, ASSIGNABLE_ORDER_LIMIT).map(mapOrderRow) };
+  } catch (error) { return fail(error); }
 }
 
 export async function resolveTicketAction(input: {

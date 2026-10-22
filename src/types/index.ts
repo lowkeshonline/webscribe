@@ -84,6 +84,8 @@ export interface AccountCredential {
   id: string;
   serviceId: string;
   serviceTitle: string;
+  variantId?: string;
+  variantName?: string;
   username?: string;
   profileName?: string;
   password?: string;
@@ -156,6 +158,13 @@ export interface AdminTicketPage extends PaginatedResult<Ticket> {
 }
 
 export interface AdminOrderPage extends PaginatedResult<Order> {
+  serviceTitle: string;
+  serviceTypes: string[];
+  search: string;
+}
+
+export interface AdminOrdersPage extends PaginatedResult<Order> {
+  paymentStatus: PaymentStatus | 'all';
   serviceTitle: string;
   serviceTypes: string[];
   search: string;
